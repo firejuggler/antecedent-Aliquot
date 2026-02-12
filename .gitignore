@@ -1,0 +1,20 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# Backup files
+*.bak
+
+# Cache files
+*.json
+*.jsonl
+*.json.gz
+
+# IDEs
+.vscode/
+.idea/
+*.swp
+*.swo
