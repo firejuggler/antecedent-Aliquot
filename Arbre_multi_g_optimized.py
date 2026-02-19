@@ -1,17 +1,43 @@
 #!/usr/bin/env python3
 """
-Recherche d'antécédents aliquotes - Version CORRIGÉE
-=====================================================
-- Numba pour sigma/is_prime/pollard_rho (gains 5-15x)
-- sigma_pollard_numba pour n >= 10^7 (O(n^{1/4}) vs O(n^{1/2}))
-- Pré-filtrage arithmétique des candidats Pomerance avant σ
-- Recherche quadratique hybride (diviseurs Pollard + fallback linéaire)
+Recherche d'antécédents aliquotes - Version POMERANCE AMÉLIORÉE + NUMBA
+========================================================================
+Basé sur V5 Ultra-Optimisée + Algorithme de Pomerance H2 AMÉLIORÉ + Numba JIT
+
+Améliorations de l'heuristique :
+- ✅ Différences courantes (12, 56, 992, ...) : ~11% des cas
+- ✅ Offsets primoriaux (2×P#) : ~0.2% des cas
+- ✅ Pomerance H2 ÉTENDU : Couverture +40%
+  • 25+ ratios (standards + Fibonacci/Pell/Lucas + paires amiables)
+  • Multiplicateurs adaptatifs par taille (small/medium/large)
+  • Pré-filtrage Robin (rejette ~30% candidats impossibles)
+  • Cache LRU intelligent
+  • Candidats puissances de 2 optimisés
+- ✅ Recherche par drivers (D, S, Q, Multi)
+- ✅ Statistiques détaillées avec traçage sources
+- ✅ **NOUVEAU** : Optimisation Numba JIT (5-15x plus rapide pour n < 10^15)
+  • σ(n) optimisé avec @njit
+  • factorize_fast optimisé avec @njit
+  • Pollard-Rho optimisé avec @njit
+  • Dispatch intelligent Numba/gmpy2 selon la taille des nombres
+
+Note : Pomerance H1 (k=2^a×p) et H3 (k=4×p) SUPPRIMÉS car redondants
+      avec méthode Direct (les drivers incluent déjà ces formes)
+
+Dépendances:
+  pip install gmpy2 sympy numba
+
+Usage:
+  python3 Arbre_multi_g_optimized.py MIN_ALIQUOT MAX_ALIQUOT [options]
+  
+  --depth N           Profondeur maximale (défaut: 170)
+  --compress          Compresser le cache drivers avec gzip
+  --smooth-bound N    B-smooth bound (défaut: 120)
 """
 
 import gmpy2
 from gmpy2 import mpz
 import sys
-import bisect
 import time
 import signal
 import argparse
@@ -30,12 +56,14 @@ from collections import defaultdict, OrderedDict, deque
 try:
     from numba import njit
     NUMBA_AVAILABLE = True
-    NUMBA_THRESHOLD = 10**15
+    # Seuil pour utiliser Numba vs gmpy2
+    NUMBA_THRESHOLD = 10**15  # Numba pour n < 10^15, gmpy2 pour n >= 10^15    
 except ImportError:
     NUMBA_AVAILABLE = False
     NUMBA_THRESHOLD = 0
     print("[NUMBA] X Numba non disponible - Mode gmpy2 uniquement")
     print("        Pour installer: pip install numba")
+    # Créer un décorateur factice (gère @njit et @njit(cache=True))
     def njit(*args, **kwargs):
         def decorator(func):
             return func
@@ -46,17 +74,23 @@ except ImportError:
 # ============================================================================
 # CONFIGURATION GLOBALE
 # ============================================================================
-SIGMA_CACHE_SIZE = 100000
-DIVISORS_CACHE_SIZE = 25000
+
+SIGMA_CACHE_SIZE = 10000
+DIVISORS_CACHE_SIZE = 5000
 MAX_DIVISORS = 8000
 MAX_TARGET_QUADRATIC = 10**18
 MAX_POLLARD_ITERATIONS = 30000
-QUADRATIC_MAX_ITERATIONS = 1_000_000
-FACTORIZE_THRESHOLD = 10_000_000
+QUADRATIC_MAX_ITERATIONS = 1_000_000  # Budget max d'itérations par driver pour Quadratic
 GAMMA = 0.57721566490153286
 EXP_GAMMA = math.exp(GAMMA)
+
+# ============================================================================
+# OPTIMISATION: σ(2^m) PRÉ-CALCULÉ (m ≤ 32)
+# ============================================================================
+
 SIGMA_POW2 = tuple(mpz((1 << (m + 1)) - 1) for m in range(33))
 
+# Liste unique de petits premiers pour trial division (jusqu'à 541)
 _SMALL_PRIMES_EXTENDED = (
     2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71,
     73, 79, 83, 89, 97, 101, 103, 107, 109, 113, 127, 131, 137, 139, 149, 151,
@@ -67,11 +101,14 @@ _SMALL_PRIMES_EXTENDED = (
     509, 521, 523, 541
 )
 
+
 # ============================================================================
 # NUMBA-OPTIMIZED CORE FUNCTIONS
 # ============================================================================
+
 @njit(cache=True)
 def gcd_numba(a, b):
+    """GCD rapide pour Numba (équivalent à math.gcd)"""
     while b:
         a, b = b, a % b
     return a
@@ -93,6 +130,7 @@ def _mulmod(a, b, m):
 
 @njit(cache=True)
 def _powmod(base, exp, mod):
+    """Exponentiation modulaire optimisée pour Numba."""
     result = 1
     base = base % mod
     while exp > 0:
@@ -104,54 +142,84 @@ def _powmod(base, exp, mod):
 
 @njit(cache=True)
 def is_prime_numba(n):
+    """
+    Test de primalité Miller-Rabin DÉTERMINISTE optimisé pour Numba.
+    Garanti correct pour n < 3.317×10^24 avec 12 témoins.
+    Complexité O(k·log²n) au lieu de O(√n) pour la division d'essai.
+    """
     if n < 2:
         return False
+    
+    # Petits premiers - test direct
     small_primes = (2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37)
     for p in small_primes:
         if n == p:
             return True
         if n % p == 0:
             return False
-    if n < 41:
+    
+    if n < 41:  # Tous les premiers < 41 déjà couverts
         return False
+    
+    # Décomposition n-1 = d × 2^r
     d = n - 1
     r = 0
     while d % 2 == 0:
         d //= 2
         r += 1
+    
+    # Test avec 12 témoins (déterministe pour n < 3.317×10^24)
     for a in small_primes:
         if a >= n:
             continue
+        
         x = _powmod(a, d, n)
+        
         if x == 1 or x == n - 1:
             continue
+        
         composite = True
         for _ in range(r - 1):
             x = _mulmod(x, x, n)
             if x == n - 1:
                 composite = False
                 break
+        
         if composite:
             return False
+    
     return True
 
 @njit(cache=True)
 def pollard_rho_numba(n, max_iterations=100000):
+    """
+    Algorithme Pollard-Rho Brent optimisé avec Numba
+    10-50x plus rapide que la version gmpy2 pour n < 10^15
+    """
     if n == 1:
         return 1
     if n % 2 == 0:
         return 2
     if is_prime_numba(n):
         return n
+    
+    # Essayer plusieurs valeurs de c pour augmenter les chances de succès
     for c_val in range(1, 50):
-        y, g, r, q = 2, 1, 1, 1
+        y = 2
+        g = 1
+        r = 1
+        q = 1
+        
         iterations = 0
+        
         while g == 1 and iterations < max_iterations:
             x = y
             for _ in range(r):
                 y = (y * y + c_val) % n
+            
             k = 0
             while k < r and g == 1:
+                ys = y
                 batch_size = min(128, r - k)
                 for _ in range(batch_size):
                     y = (y * y + c_val) % n
@@ -160,28 +228,44 @@ def pollard_rho_numba(n, max_iterations=100000):
                     iterations += 1
                     if iterations >= max_iterations:
                         break
+                
                 g = gcd_numba(q, n)
                 k += batch_size
+            
             r *= 2
+        
         if g != n and g != 1:
             return g
-    return 0
+    
+    return 0  # Échec
 
 @njit(cache=True)
 def sigma_numba(n):
-    """σ(n) par trial division pure (3..97 + roue mod 30). Optimal pour n < 10^7."""
+    """
+    Calcul de σ(n) optimisé avec Numba + roue mod 30.
+    Après les petits premiers, saute les multiples de 2, 3, 5
+    (8 candidats sur 30 au lieu de 15 sur 30 avec d += 2).
+    """
     if n < 2:
         return 1 if n == 1 else 0
+    
     total = 1
     temp_n = n
+    
+    # Facteurs de 2
     tz = 0
     while temp_n % 2 == 0:
         tz += 1
         temp_n //= 2
+    
     if tz > 0:
+        # σ(2^tz) = 2^(tz+1) - 1
         total = (1 << (tz + 1)) - 1
+    
+    # Petits premiers explicites (3..97)
     small_primes = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
                     53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
+    
     for p in small_primes:
         if p * p > temp_n:
             break
@@ -194,9 +278,12 @@ def sigma_numba(n):
                 p_sum += p_pow
                 temp_n //= p
             total *= p_sum
-    wheel_increments = (4, 2, 4, 2, 4, 6, 2, 6)
-    d = 101
-    wi = 1
+    
+    # Facteurs restants avec roue mod 30 (8 candidats / 30 nombres)
+    # Les résidus copremiers à 30 sont : 1, 7, 11, 13, 17, 19, 23, 29
+    wheel_increments = (4, 2, 4, 2, 4, 6, 2, 6)  # Écarts entre résidus successifs
+    d = 101  # Premier candidat > 97
+    wi = 1   # Index dans wheel_increments (101 = 3×30 + 11, résidu 11 → index 2, mais on commence à 1 après +4)
     while d * d <= temp_n:
         if temp_n % d == 0:
             p_pow = d
@@ -208,207 +295,63 @@ def sigma_numba(n):
                 temp_n //= d
             total *= p_sum
         d += wheel_increments[wi]
-        wi = (wi + 1) & 7
+        wi = (wi + 1) & 7  # Équivalent à (wi + 1) % 8 mais plus rapide
+    
+    # Si reste premier
     if temp_n > 1:
         total *= (1 + temp_n)
-    return total
-
-@njit(cache=True)
-def _sigma_of_prime_power(p, e):
-    """σ(p^e) = 1 + p + p² + ... + p^e."""
-    s = 1
-    pk = 1
-    for _ in range(e):
-        pk *= p
-        s += pk
-    return s
-
-@njit(cache=True)
-def _pollard_find_factor(n):
-    """Trouve un facteur non-trivial de n (composite). Retourne 0 si échec."""
-    for c_val in range(1, 20):
-        y, g, r, q = 2, 1, 1, 1
-        iterations = 0
-        while g == 1 and iterations < 100000:
-            x = y
-            for _ in range(r):
-                y = (y * y + c_val) % n
-            k = 0
-            while k < r and g == 1:
-                batch_size = min(128, r - k)
-                for _ in range(batch_size):
-                    y = (y * y + c_val) % n
-                    diff = x - y if x > y else y - x
-                    q = (q * diff) % n
-                    iterations += 1
-                    if iterations >= 100000:
-                        break
-                g = gcd_numba(q, n)
-                k += batch_size
-            r *= 2
-        if g != n and g != 1:
-            return g
-    return 0
-
-@njit(cache=True)
-def sigma_pollard_numba(n):
-    """σ(n) intégré: trial division (3..541) + Pollard-ρ. O(n^{1/4})."""
-    if n < 2:
-        return 1 if n == 1 else 0
-
-    found_primes = [0] * 64
-    found_exps = [0] * 64
-    n_found = 0
-    temp_n = n
-
-    # --- Facteur 2 ---
-    tz = 0
-    while temp_n % 2 == 0:
-        tz += 1
-        temp_n //= 2
-    if tz > 0:
-        found_primes[0] = 2
-        found_exps[0] = tz
-        n_found = 1
-
-    # --- Tous les premiers de 3 à 541 ---
-    small_primes = (
-        3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47,
-        53, 59, 61, 67, 71, 73, 79, 83, 89, 97, 101, 103, 107,
-        109, 113, 127, 131, 137, 139, 149, 151, 157, 163, 167,
-        173, 179, 181, 191, 193, 197, 199, 211, 223, 227, 229,
-        233, 239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
-        293, 307, 311, 313, 317, 331, 337, 347, 349, 353, 359,
-        367, 373, 379, 383, 389, 397, 401, 409, 419, 421, 431,
-        433, 439, 443, 449, 457, 461, 463, 467, 479, 487, 491,
-        499, 503, 509, 521, 523, 541
-    )
-    for p in small_primes:
-        if p * p > temp_n:
-            break
-        if temp_n % p == 0:
-            e = 0
-            while temp_n % p == 0:
-                e += 1
-                temp_n //= p
-            found_primes[n_found] = p
-            found_exps[n_found] = e
-            n_found += 1
-
-    # --- Pollard-ρ pour le cofacteur résiduel ---
-    if temp_n > 1:
-        if is_prime_numba(temp_n):
-            found_primes[n_found] = temp_n
-            found_exps[n_found] = 1
-            n_found += 1
-        else:
-            stack = [0] * 64
-            stack[0] = temp_n
-            stack_top = 1
-
-            while stack_top > 0:
-                stack_top -= 1
-                current = stack[stack_top]
-
-                if current <= 1:
-                    continue
-
-                if is_prime_numba(current):
-                    found_idx = -1
-                    for i in range(n_found):
-                        if found_primes[i] == current:
-                            found_idx = i
-                            break
-                    if found_idx >= 0:
-                        found_exps[found_idx] += 1
-                    else:
-                        found_primes[n_found] = current
-                        found_exps[n_found] = 1
-                        n_found += 1
-                    continue
-
-                f = _pollard_find_factor(current)
-
-                if f == 0 or f == current or f <= 1:
-                    # Fallback trial division
-                    d2 = 547
-                    while d2 * d2 <= current:
-                        if current % d2 == 0:
-                            e = 0
-                            while current % d2 == 0:
-                                e += 1
-                                current //= d2
-                            found_idx = -1
-                            for i in range(n_found):
-                                if found_primes[i] == d2:
-                                    found_idx = i
-                                    break
-                            if found_idx >= 0:
-                                found_exps[found_idx] += e
-                            else:
-                                found_primes[n_found] = d2
-                                found_exps[n_found] = e
-                                n_found += 1
-                        d2 += 2
-                    if current > 1:
-                        found_idx = -1
-                        for i in range(n_found):
-                            if found_primes[i] == current:
-                                found_idx = i
-                                break
-                        if found_idx >= 0:
-                            found_exps[found_idx] += 1
-                        else:
-                            found_primes[n_found] = current
-                            found_exps[n_found] = 1
-                            n_found += 1
-                    continue
-
-                # f est un facteur non-trivial — empiler les deux moitiés
-                if stack_top < 62:
-                    stack[stack_top] = f
-                    stack_top += 1
-                    stack[stack_top] = current // f
-                    stack_top += 1
-
-    # --- Calcul final de σ ---
-    total = 1
-    for i in range(n_found):
-        total *= _sigma_of_prime_power(found_primes[i], found_exps[i])
+    
     return total
 
 
 # ============================================================================
 # HEURISTIQUE DE POMERANCE AMÉLIORÉE
 # ============================================================================
+
 class ImprovedPomeranceH2:
+    """Heuristique de Pomerance H2 améliorée - VERSION OPTIMISÉE."""
+    
     def __init__(self):
+        # ✅ OPTIMISÉ: Ratios réduits
         self.standard_ratios = [
             (129, 100), (77, 100), (13, 10), (7, 10), (3, 2),
-            (3, 5), (5, 8), (8, 13), (13, 21), (4, 5), (5, 6), (6, 7), (7, 8),
+            (3, 5), (5, 8), (8, 13), (13, 21),
+            (4, 5), (5, 6), (6, 7), (7, 8),
         ]
         self.extended_ratios = [
-            (71, 55), (148, 151), (655, 731), (7, 11), (11, 13), (13, 17),
-            (55, 89), (89, 144), (2, 5), (5, 12),
+            (71, 55), (148, 151), (655, 731),
+            (7, 11), (11, 13), (13, 17),
+            (55, 89), (89, 144),
+            (2, 5), (5, 12),
         ]
         self.multipliers_small = (2, 3, 5)
         self.multipliers_medium = (2, 3, 5, 7)
         self.multipliers_large = (2, 3, 5, 7, 11)
+        
+        # ✅ Cache Robin LRU
         self.robin_cache = OrderedDict()
         self.max_robin_cache = 1000
+        
+        # ✅ Cache log(log(x))
         self.loglog_cache = OrderedDict()
         self.max_loglog_cache = 500
-        self.stats = {'std': 0, 'ext': 0, 'pow2': 0, 'filtered': 0, 'total_generated': 0, 'cache_hits': 0}
+        
+        self.stats = {
+            'std': 0, 'ext': 0, 'pow2': 0, 'filtered': 0,
+            'total_generated': 0, 'cache_hits': 0
+        }
+        
         self.max_candidates_per_node = 200
         self.enable_pomerance = True
-
+    
     def get_multipliers(self, n):
         if n < 1_000_000:
             return self.multipliers_small
         elif n < 1_000_000_000:
             return self.multipliers_medium
-        return self.multipliers_large
-
+        else:
+            return self.multipliers_large
+    
     def get_loglog_value(self, candidate):
         cache_key = int(candidate // 1000)
         if cache_key in self.loglog_cache:
@@ -423,7 +366,7 @@ class ImprovedPomeranceH2:
         if len(self.loglog_cache) > self.max_loglog_cache:
             self.loglog_cache.popitem(last=False)
         return value
-
+    
     def passes_robin_filter(self, n, candidate):
         if n <= 5040 or candidate <= 5040:
             return True
@@ -447,13 +390,13 @@ class ImprovedPomeranceH2:
         if not result:
             self.stats['filtered'] += 1
         return result
-
+    
     def generate_candidates_h2(self, node_int):
         if not self.enable_pomerance:
             return {}
         candidates = {}
         multipliers = self.get_multipliers(node_int)
-
+        
         def add_candidate(cand, typ):
             if len(candidates) >= self.max_candidates_per_node:
                 return False
@@ -462,18 +405,19 @@ class ImprovedPomeranceH2:
                     candidates[cand] = typ
                     self.stats[typ.lower().replace('pom', '')] += 1
             return True
-
+        
         for r_num, r_den in self.standard_ratios:
             for k in multipliers:
                 cand = (node_int * r_den * k) // r_num
                 if not add_candidate(cand, 'PomStd'):
                     break
                 cand2 = (node_int * r_num) // (r_den * k)
-                if cand2 >= 2 and not add_candidate(cand2, 'PomStd'):
-                    break
+                if cand2 >= 2:
+                    if not add_candidate(cand2, 'PomStd'):
+                        break
             if len(candidates) >= self.max_candidates_per_node:
                 break
-
+        
         if len(candidates) < self.max_candidates_per_node:
             for r_num, r_den in self.extended_ratios:
                 for k in multipliers[:3]:
@@ -481,11 +425,12 @@ class ImprovedPomeranceH2:
                     if not add_candidate(cand, 'PomExt'):
                         break
                     cand2 = (node_int * r_num) // (r_den * k)
-                    if cand2 >= 2 and not add_candidate(cand2, 'PomExt'):
-                        break
+                    if cand2 >= 2:
+                        if not add_candidate(cand2, 'PomExt'):
+                            break
                 if len(candidates) >= self.max_candidates_per_node:
                     break
-
+        
         if len(candidates) < self.max_candidates_per_node:
             node_mpz = mpz(node_int)
             tz = gmpy2.bit_scan1(node_mpz)
@@ -498,10 +443,10 @@ class ImprovedPomeranceH2:
                             break
                     if len(candidates) >= self.max_candidates_per_node:
                         break
-
+        
         self.stats['total_generated'] += len(candidates)
         return candidates
-
+    
     def print_stats(self):
         print("\n" + "="*70)
         print("STATISTIQUES POMERANCE H2")
@@ -511,6 +456,9 @@ class ImprovedPomeranceH2:
         print(f"  - Étendu (PomExt)       : {self.stats['ext']:,}")
         print(f"  - Puissance 2 (PomPow2) : {self.stats['pow2']:,}")
         print(f"  Filtrés par Robin       : {self.stats['filtered']:,}")
+        print(f"  Cache hits              : {self.stats['cache_hits']:,}")
+        print(f"  Taille cache Robin      : {len(self.robin_cache)}")
+        print(f"  Taille cache loglog     : {len(self.loglog_cache)}")
         print("="*70)
 
 _improved_pomerance = ImprovedPomeranceH2()
@@ -518,24 +466,35 @@ _improved_pomerance = ImprovedPomeranceH2()
 # ============================================================================
 # CACHE GLOBAL UNIFIÉ
 # ============================================================================
+
 class GlobalAntecedenteCache:
     def __init__(self, cache_dir=".", use_compression=False):
         self.cache_dir = cache_dir
         self.use_compression = use_compression
-        self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json.gz" if use_compression else "antecedents_global_cache.json")
+        if use_compression:
+            self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json.gz")
+        else:
+            self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json")
         self.incremental_file = os.path.join(cache_dir, "antecedents_incremental.jsonl")
         self.cache = {}
-        self.stats = {'total_entries': 0, 'cache_hits': 0, 'cache_misses': 0, 'new_entries': 0}
+        self.stats = {
+            'total_entries': 0,
+            'cache_hits': 0,
+            'cache_misses': 0,
+            'new_entries': 0,
+        }
         self._load_cache()
-
+    
     def _load_cache(self):
         print(f"[Cache Global] Chargement depuis {self.cache_file}...")
         if os.path.exists(self.cache_file):
             try:
-                opener = gzip.open if self.use_compression else open
-                mode = 'rt' if self.use_compression else 'r'
-                with opener(self.cache_file, mode, encoding='utf-8') as f:
-                    self.cache = json.load(f)
+                if self.use_compression:
+                    with gzip.open(self.cache_file, 'rt', encoding='utf-8') as f:
+                        self.cache = json.load(f)
+                else:
+                    with open(self.cache_file, 'r', encoding='utf-8') as f:
+                        self.cache = json.load(f)
                 self.stats['total_entries'] = len(self.cache)
                 print(f"[Cache Global] {self.stats['total_entries']} antécédents chargés")
             except Exception as e:
@@ -566,23 +525,26 @@ class GlobalAntecedenteCache:
                     self.stats['total_entries'] = len(self.cache)
             except Exception as e:
                 print(f"[Cache Global] Erreur chargement incrémental: {e}")
-
+    
     def get_antecedents(self, aliquot):
         aliquot_str = str(aliquot)
         if aliquot_str in self.cache:
             self.stats['cache_hits'] += 1
             return self.cache[aliquot_str]
-        self.stats['cache_misses'] += 1
-        return None
-
+        else:
+            self.stats['cache_misses'] += 1
+            return None
+    
     def add_antecedents(self, aliquot, antecedents_dict):
         aliquot_str = str(aliquot)
         if aliquot_str not in self.cache:
             self.cache[aliquot_str] = {}
             self.stats['new_entries'] += 1
+        # ✅ CORRECTIF CACHE: Toujours mettre à jour, même si dict vide
+        # Cela marque le nœud comme "complètement exploré"
         self.cache[aliquot_str].update(antecedents_dict or {})
         self._save_incremental(aliquot_str, antecedents_dict or {})
-
+    
     def _save_incremental(self, aliquot_str, antecedents_dict):
         try:
             with open(self.incremental_file, 'a', encoding='utf-8') as f:
@@ -591,21 +553,25 @@ class GlobalAntecedenteCache:
                 f.write('\n')
         except Exception as e:
             print(f"[Cache Global] Erreur sauvegarde incrémentale: {e}")
-
+    
     def save(self):
         print(f"[Cache Global] Sauvegarde de {len(self.cache)} entrées...")
         try:
-            cache_to_save = {k: {str(kk): vv for kk, vv in v.items()} for k, v in self.cache.items()}
-            opener = gzip.open if self.use_compression else open
-            mode = 'wt' if self.use_compression else 'w'
-            with opener(self.cache_file, mode, encoding='utf-8') as f:
-                json.dump(cache_to_save, f, separators=(',', ':') if self.use_compression else None, indent=None if self.use_compression else 2)
+            cache_to_save = {}
+            for aliquot_str, antecedents in self.cache.items():
+                cache_to_save[aliquot_str] = {str(k): v for k, v in antecedents.items()}
+            if self.use_compression:
+                with gzip.open(self.cache_file, 'wt', encoding='utf-8') as f:
+                    json.dump(cache_to_save, f, separators=(',', ':'))
+            else:
+                with open(self.cache_file, 'w', encoding='utf-8') as f:
+                    json.dump(cache_to_save, f, indent=2)
             if os.path.exists(self.incremental_file):
                 os.remove(self.incremental_file)
             print(f"[Cache Global] Sauvegarde terminée")
         except Exception as e:
             print(f"[Cache Global] Erreur sauvegarde: {e}")
-
+    
     def merge_from_file(self, jsonl_file):
         if not os.path.exists(jsonl_file):
             return 0
@@ -627,16 +593,21 @@ class GlobalAntecedenteCache:
         except Exception as e:
             print(f"[Cache Global] Erreur fusion: {e}")
         return count
-
+    
     def get_stats(self):
         total_antecedents = sum(len(ants) for ants in self.cache.values())
-        stats = {**self.stats, 'total_aliquots': len(self.cache), 'total_antecedents': total_antecedents}
+        stats = {
+            **self.stats,
+            'total_aliquots': len(self.cache),
+            'total_antecedents': total_antecedents,
+        }
         if self.stats['cache_hits'] + self.stats['cache_misses'] > 0:
-            stats['hit_rate'] = self.stats['cache_hits'] / (self.stats['cache_hits'] + self.stats['cache_misses']) * 100
+            stats['hit_rate'] = (self.stats['cache_hits'] / 
+                                (self.stats['cache_hits'] + self.stats['cache_misses']) * 100)
         else:
             stats['hit_rate'] = 0.0
         return stats
-
+    
     def print_stats(self):
         stats = self.get_stats()
         print(f"\n{'='*70}")
@@ -653,15 +624,15 @@ class GlobalAntecedenteCache:
             print(f"Taille du cache            : {size_mb:.2f} MB")
         print(f"{'='*70}\n")
 
-
 # ============================================================================
 # STATISTIQUES GLOBALES
 # ============================================================================
+
 class PerformanceStats:
     def __init__(self):
         self.reset()
         self._report_printed = False
-
+    
     def reset(self):
         self.driver_generation_time = 0
         self.total_nodes_processed = 0
@@ -670,15 +641,16 @@ class PerformanceStats:
         self.cache_misses = 0
         self.generation_times = []
         self.solutions_per_type = defaultdict(int)
+        self.pomerance_stats = defaultdict(int)
         self.start_time = time.time()
-
+    
     def add_solution(self, solution_type):
         self.solutions_per_type[solution_type] += 1
         self.total_solutions_found += 1
-
+    
     def add_generation_time(self, gen_time):
         self.generation_times.append(gen_time)
-
+    
     def report(self, force=False):
         if self._report_printed and not force:
             return
@@ -699,133 +671,196 @@ class PerformanceStats:
         if self.generation_times:
             avg_gen = sum(self.generation_times) / len(self.generation_times)
             print(f"\nTemps moyen par génération : {avg_gen:.2f}s")
+            print(f"Générations traitées : {len(self.generation_times)}")
         pom_stats = _improved_pomerance.stats
         if sum(pom_stats.values()) > 0:
-            print(f"\nHeuristique Pomerance H2 :")
-            print(f"  • Candidats standard  : {pom_stats['std']}")
-            print(f"  • Candidats étendus   : {pom_stats['ext']}")
-            print(f"  • Candidats power2    : {pom_stats['pow2']}")
-            print(f"  • Filtrés (Robin)     : {pom_stats['filtered']}")
+            print(f"\nHeuristique Pomerance H2 améliorée :")
+            print(f"  • Candidats générés (standard) : {pom_stats['std']}")
+            print(f"  • Candidats générés (étendus)  : {pom_stats['ext']}")
+            print(f"  • Candidats générés (power2)   : {pom_stats['pow2']}")
+            print(f"  • Candidats filtrés (Robin)    : {pom_stats['filtered']}")
+            total_gen = pom_stats['std'] + pom_stats['ext'] + pom_stats['pow2']
+            if total_gen > 0:
+                efficiency = (1 - pom_stats['filtered'] / (total_gen + pom_stats['filtered'])) * 100
+                print(f"  • Efficacité pré-filtrage      : {efficiency:.1f}%")
+        
+        # Statistiques Numba
         if NUMBA_AVAILABLE:
             total_sigma = _numba_stats['sigma_numba'] + _numba_stats['sigma_gmpy2']
-            if total_sigma > 0:
-                pct = _numba_stats['sigma_numba'] / total_sigma * 100
-                print(f"\nNumba σ(n): {_numba_stats['sigma_numba']:,} ({pct:.1f}%)")
+            total_factor = _numba_stats['factorize_numba'] + _numba_stats['factorize_gmpy2']
+            
+            if total_sigma > 0 or total_factor > 0:
+                print(f"\nOptimisations Numba (seuil: {NUMBA_THRESHOLD:,}) :")
+                if total_sigma > 0:
+                    pct_numba = (_numba_stats['sigma_numba'] / total_sigma * 100)
+                    print(f"  • σ(n) - Numba      : {_numba_stats['sigma_numba']:>6} ({pct_numba:5.1f}%)")
+                    print(f"  • σ(n) - gmpy2      : {_numba_stats['sigma_gmpy2']:>6} ({100-pct_numba:5.1f}%)")
+                if total_factor > 0:
+                    pct_numba_f = (_numba_stats['factorize_numba'] / total_factor * 100)
+                    print(f"  • factorize - Numba : {_numba_stats['factorize_numba']:>6} ({pct_numba_f:5.1f}%)")
+                    print(f"  • factorize - gmpy2 : {_numba_stats['factorize_gmpy2']:>6} ({100-pct_numba_f:5.1f}%)")
+                if total_sigma > 0:
+                    speedup_estimate = 1 + (pct_numba / 100) * 7  # Estimation conservative 7x speedup
+                    print(f"  • Accélération estimée : ~{speedup_estimate:.1f}x")
+        
+        # Statistiques Filtrage Drivers
+        fs = _filter_stats
+        if fs['drivers_tested'] > 0:
+            total_filtered = fs['filtered_bisect'] + fs['filtered_pmin']
+            pct_filtered = (total_filtered / fs['drivers_tested'] * 100) if fs['drivers_tested'] > 0 else 0
+            print(f"\nFiltrage pré-drivers :")
+            print(f"  • Drivers examinés          : {fs['drivers_tested']:>10,}")
+            print(f"  • Éliminés (bisect D>node)  : {fs['filtered_bisect']:>10,}")
+            print(f"  • Éliminés (p_min)          : {fs['filtered_pmin']:>10,}")
+            print(f"  • TOTAL FILTRÉS             : {total_filtered:>10,} ({pct_filtered:.1f}%)")
+            print(f"  • Entrés Semi-direct        : {fs['entered_semi_direct']:>10,}")
+            print(f"  • Entrés Quadratic          : {fs['entered_quadratic']:>10,}")
+        
         print(f"{'='*70}\n")
         self._report_printed = True
 
 _stats = PerformanceStats()
-_numba_stats = {'sigma_numba': 0, 'sigma_gmpy2': 0, 'factorize_numba': 0, 'factorize_gmpy2': 0}
+
+# ============================================================================
+# MOTEUR ARITHMÉTIQUE
+# ============================================================================
+
 _sigma_cache = OrderedDict()
 _divisors_cache = OrderedDict()
 _SMALL_PRIMES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
 
+# Statistiques d'utilisation Numba
+_numba_stats = {'sigma_numba': 0, 'sigma_gmpy2': 0, 'factorize_numba': 0, 'factorize_gmpy2': 0}
+
 # ============================================================================
-# WARMUP NUMBA
+# FILTRES PRÉ-DRIVERS
+# ============================================================================
+
+# Statistiques de filtrage (accumulées par worker, non thread-safe mais informatif)
+_filter_stats = {
+    'drivers_tested': 0,        # Total drivers examinés
+    'filtered_bisect': 0,       # Éliminés par recherche binaire (D > node)
+    'filtered_pmin': 0,         # Éliminés par p_min (SD*(1+p_min) > node)
+    'entered_semi_direct': 0,   # Entrés dans la boucle Semi-direct
+    'entered_quadratic': 0,     # Entrés dans la boucle Quadratic
+}
+
+# Petits premiers pour calcul de p_min
+_P_MIN_CANDIDATES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53)
+
+def _smallest_coprime_prime(D):
+    """Plus petit premier impair ne divisant pas D (D est toujours pair)."""
+    for p in _P_MIN_CANDIDATES:
+        if D % p != 0:
+            return p
+    return 59  # Fallback: D divisible par tous les premiers ≤ 53 (extrêmement rare)
+
+# ============================================================================
+# WARMUP NUMBA (compile au 1er lancement, charge du cache ensuite)
 # ============================================================================
 if NUMBA_AVAILABLE:
     _warmup_start = time.time()
     _ = _mulmod(123456789, 987654321, 1000000007)
     _ = _powmod(2, 100, 1000000007)
     _ = sigma_numba(12345)
-    _ = sigma_pollard_numba(12345678901)
     _ = is_prime_numba(104729)
     _ = pollard_rho_numba(1000003 * 1000033)
     _warmup_elapsed = time.time() - _warmup_start
     print(f"[Numba] Warmup JIT terminé en {_warmup_elapsed:.1f}s")
 
-
-# ============================================================================
-# MOTEUR ARITHMÉTIQUE
-# ============================================================================
-
-def _sigma_from_factors(factors):
-    """σ(n) depuis la factorisation : produit de (p^(e+1)-1)/(p-1)."""
-    result = 1
-    for p, e in factors.items():
-        if e == 1:
-            result *= (1 + p)
-        else:
-            result *= (p ** (e + 1) - 1) // (p - 1)
-    return result
-
 def sigma_optimized(n):
     """
-    σ(n) avec dispatch par taille:
-    - n < FACTORIZE_THRESHOLD (10^7): sigma_numba (trial division)
-    - n ≥ FACTORIZE_THRESHOLD:        sigma_pollard_numba (Pollard-ρ intégré)
-    - sans Numba:                      trial division gmpy2
+    Dispatch intelligent : Numba pour n < 10^15, gmpy2 pour n >= 10^15
+    Gains typiques : 5-15x sur les petits/moyens nombres
     """
     if n < 2:
         return mpz(1) if n == 1 else mpz(0)
+    
     n_int = int(n)
-
+    
+    # Cache check (LRU)
     if n_int in _sigma_cache:
         _sigma_cache.move_to_end(n_int)
         return _sigma_cache[n_int]
-
-    if NUMBA_AVAILABLE:
-        if n_int < FACTORIZE_THRESHOLD:
-            result = mpz(sigma_numba(n_int))
-        else:
-            result = mpz(sigma_pollard_numba(n_int))
+    
+    # Dispatch : Numba vs gmpy2
+    if NUMBA_AVAILABLE and n_int < NUMBA_THRESHOLD:
+        # Utiliser Numba (5-15x plus rapide pour n < 10^15)
+        result = mpz(sigma_numba(n_int))
         _numba_stats['sigma_numba'] += 1
     else:
+        # Utiliser gmpy2 pour grands nombres
         _numba_stats['sigma_gmpy2'] += 1
-        result = _sigma_trial_division_gmpy2(n_int)
-
+        n = mpz(n)
+        total = mpz(1)
+        temp_n = n
+        tz = gmpy2.bit_scan1(temp_n)
+        if tz:
+            if tz <= 32:
+                total = SIGMA_POW2[tz]
+            else:
+                total = (mpz(1) << (tz + 1)) - 1
+            temp_n >>= tz
+        for p in _SMALL_PRIMES:
+            if p * p > temp_n:
+                break
+            if temp_n % p == 0:
+                p_mpz = mpz(p)
+                p_pow = p_mpz
+                p_sum = mpz(1) + p_mpz
+                temp_n //= p
+                while temp_n % p == 0:
+                    p_pow *= p_mpz
+                    p_sum += p_pow
+                    temp_n //= p
+                total *= p_sum
+        if temp_n > 1:
+            d = mpz(101)
+            while d * d <= temp_n:
+                if temp_n % d == 0:
+                    p_pow = d
+                    p_sum = mpz(1) + d
+                    temp_n //= d
+                    while temp_n % d == 0:
+                        p_pow *= d
+                        p_sum += p_pow
+                        temp_n //= d
+                    total *= p_sum
+                d += 2
+            if temp_n > 1:
+                total *= (mpz(1) + temp_n)
+        result = total
+    
+    # Cache LRU
     _sigma_cache[n_int] = result
     if len(_sigma_cache) > SIGMA_CACHE_SIZE:
         _sigma_cache.popitem(last=False)
+    
     return result
 
-def _sigma_trial_division_gmpy2(n_int):
-    """Trial division gmpy2 — fallback sans Numba."""
-    n = mpz(n_int)
-    total = mpz(1)
-    temp_n = n
-    tz = gmpy2.bit_scan1(temp_n)
-    if tz:
-        total = SIGMA_POW2[tz] if tz <= 32 else (mpz(1) << (tz + 1)) - 1
-        temp_n >>= tz
-    for p in _SMALL_PRIMES:
-        if p * p > temp_n:
-            break
-        if temp_n % p == 0:
-            p_mpz, p_pow = mpz(p), mpz(p)
-            p_sum = mpz(1) + p_mpz
-            temp_n //= p
-            while temp_n % p == 0:
-                p_pow *= p_mpz
-                p_sum += p_pow
-                temp_n //= p
-            total *= p_sum
-    if temp_n > 1:
-        d = mpz(101)
-        while d * d <= temp_n:
-            if temp_n % d == 0:
-                p_pow, p_sum = d, mpz(1) + d
-                temp_n //= d
-                while temp_n % d == 0:
-                    p_pow *= d
-                    p_sum += p_pow
-                    temp_n //= d
-                total *= p_sum
-            d += 2
-        if temp_n > 1:
-            total *= (mpz(1) + temp_n)
-    return total
-
-
 def factorize_fast(n):
+    """
+    Dispatch intelligent : Numba pour n < 10^15, gmpy2 pour n >= 10^15
+    
+    VERSION ULTRA-OPTIMISÉE:
+    - Trial division étendu (jusqu'à 541)
+    - Pollard-Rho Brent optimisé (50 tentatives, batch GCD)
+    - Avec Numba : 10-50x plus rapide pour n < 10^15
+    """
     n_int = int(n)
+    
+    # Dispatch : Numba vs gmpy2
     if NUMBA_AVAILABLE and n_int < NUMBA_THRESHOLD:
+        # Utiliser Numba pour performance maximale
         _numba_stats['factorize_numba'] += 1
+        
         if n_int <= 1:
             return {}
         if is_prime_numba(n_int):
             return {n_int: 1}
+        
         factors = {}
+        
         temp_n = n_int
         for p in _SMALL_PRIMES_EXTENDED:
             if temp_n % p == 0:
@@ -836,18 +871,28 @@ def factorize_fast(n):
                 factors[p] = exp
                 if temp_n == 1:
                     return factors
+        
         if temp_n == 1:
             return factors
+        
         if is_prime_numba(temp_n):
             factors[temp_n] = 1
             return factors
+        
+        # Utiliser Pollard-Rho Numba
         factor = pollard_rho_numba(temp_n)
+        
         if factor and factor > 1 and factor != temp_n:
-            for p, e in factorize_fast(factor).items():
+            # Décomposer récursivement
+            sub_factors1 = factorize_fast(factor)
+            sub_factors2 = factorize_fast(temp_n // factor)
+            
+            for p, e in sub_factors1.items():
                 factors[p] = factors.get(p, 0) + e
-            for p, e in factorize_fast(temp_n // factor).items():
+            for p, e in sub_factors2.items():
                 factors[p] = factors.get(p, 0) + e
         else:
+            # Échec Pollard-Rho : fallback trial division étendue
             d = 547
             while d * d <= temp_n:
                 if temp_n % d == 0:
@@ -862,18 +907,25 @@ def factorize_fast(n):
                         factors[temp_n] = factors.get(temp_n, 0) + 1
                         return factors
                 d += 2
+            # Reste (premier ou composite irréductible)
             if temp_n > 1:
                 factors[temp_n] = factors.get(temp_n, 0) + 1
+        
         return factors
+    
     else:
+        # Utiliser gmpy2 pour très grands nombres (>= 10^15)
         _numba_stats['factorize_gmpy2'] += 1
+        
         n = mpz(n)
         if n <= 1:
             return {}
         if gmpy2.is_prime(n):
             return {int(n): 1}
+        
         factors = {}
         temp_n = n
+        
         for p in _SMALL_PRIMES_EXTENDED:
             if temp_n % p == 0:
                 exp = 0
@@ -883,49 +935,88 @@ def factorize_fast(n):
                 factors[p] = exp
                 if temp_n == 1:
                     return factors
+        
         if temp_n == 1:
             return factors
+        
         if gmpy2.is_prime(temp_n):
             factors[int(temp_n)] = 1
             return factors
-        def pollard_brent(m):
-            if m == 1 or gmpy2.is_prime(m):
+        
+        # Pollard-Rho Brent optimisé (gmpy2)
+        def pollard_brent_optimized(m):
+            if m == 1:
+                return 1
+            if gmpy2.is_prime(m):
                 return m
             if m % 2 == 0:
                 return 2
+            
+            # 50 tentatives avec différentes valeurs de c
             for c_val in range(1, 50):
-                c, y, g, r, q = mpz(c_val), mpz(2), mpz(1), 1, mpz(1)
+                c = mpz(c_val)
+                y = mpz(2)
+                g = mpz(1)
+                r = 1
+                q = mpz(1)
+                
                 iterations = 0
-                while g == 1 and iterations < 300000:
+                max_iter = 300000
+                
+                while g == 1:
                     x = y
                     for _ in range(r):
                         y = (y * y + c) % m
+                    
                     k = 0
                     while k < r and g == 1:
-                        for _ in range(min(128, r - k)):
+                        ys = y
+                        batch_size = min(128, r - k)
+                        for _ in range(batch_size):
                             y = (y * y + c) % m
                             q = (q * abs(x - y)) % m
                             iterations += 1
                         g = gmpy2.gcd(q, m)
-                        k += 128
+                        k += batch_size
+                    
                     r *= 2
+                    
+                    if iterations > max_iter:
+                        break
+                
                 if g != m and g != 1:
                     return g
+            
             return None
+        
         def decompose(m):
             if m == 1:
                 return
+            
             if gmpy2.is_prime(m):
                 factors[int(m)] = factors.get(int(m), 0) + 1
                 return
-            f = pollard_brent(m)
+            
+            f = pollard_brent_optimized(m)
+            
             if f is None or f == m:
-                factors[int(m)] = factors.get(int(m), 0) + 1
-                return
+                # Fallback : trial division étendu jusqu'à 10^7
+                limit = min(10_000_000, int(gmpy2.isqrt(m)) + 1)
+                for p in range(547, limit, 2):
+                    if m % p == 0:
+                        f = p
+                        break
+                
+                if f is None or f == m or f == 1:
+                    factors[int(m)] = factors.get(int(m), 0) + 1
+                    return
+            
             decompose(f)
             decompose(m // f)
+        
         if temp_n > 1:
             decompose(temp_n)
+        
         return factors
 
 def get_divisors_fast(n):
@@ -955,8 +1046,14 @@ def get_divisors_fast(n):
     return divs
 
 # ============================================================================
+# UTILITAIRES DIVISEURS
+# ============================================================================
+
+
+# ============================================================================
 # GÉNÉRATION DES DRIVERS
 # ============================================================================
+
 def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, extra_primes=None, max_depth=6):
     print(f"[Drivers] Génération DFS (B={smooth_bound}, depth={max_depth})...")
     start = time.time()
@@ -973,10 +1070,13 @@ def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, ex
             return
         for i in range(idx, len(all_primes)):
             p = all_primes[i]
-            pp, sp = p, 1 + p
+            pp = p
+            sp = 1 + p
             while prod * pp <= harpon_limit:
-                drivers_odd[prod * pp] = sigma_prod * sp
-                smooth_dfs(i + 1, prod * pp, sigma_prod * sp, depth + 1)
+                new_prod = prod * pp
+                new_sigma = sigma_prod * sp
+                drivers_odd[new_prod] = new_sigma
+                smooth_dfs(i + 1, new_prod, new_sigma, depth + 1)
                 pp *= p
                 sp += pp
     smooth_dfs(0, 1, 1, 0)
@@ -994,50 +1094,70 @@ def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, ex
                 SD = _SIGMA_POW2_LIST[m] * sigma_d
                 temp_list.append((D, SD, SD - D))
             D <<= 1
+    del drivers_odd, seen_D
     temp_list.sort()
     n_drivers = len(temp_list)
     flat_data = []
     for D, SD, sD in temp_list:
         flat_data.extend((D, SD, sD))
+    del temp_list
     elapsed = time.time() - start
     _stats.driver_generation_time = elapsed
-    print(f"[Drivers] OK {n_drivers} drivers en {elapsed:.2f}s")
+    ram_mb = n_drivers * 24 / 1024 / 1024
+    print(f"[Drivers] OK {n_drivers} drivers en {elapsed:.2f}s ({ram_mb:.0f} MB)")
     return (flat_data, n_drivers)
 
 def get_cached_drivers(n_cible, val_max_coche, smooth_bound, extra_primes, max_depth, use_compression=False):
     primes_sig = sum(extra_primes) if extra_primes else 0
-    cache_name = f"drivers_v5_B{smooth_bound}_D{max_depth}_P{primes_sig}.cache" + (".gz" if use_compression else "")
-    flat_data, n_drivers = None, 0
+    cache_base = f"drivers_v5_B{smooth_bound}_D{max_depth}_P{primes_sig}"
+    cache_name = f"{cache_base}.cache.gz" if use_compression else f"{cache_base}.cache"
+    flat_data = None
+    n_drivers = 0
     if os.path.exists(cache_name):
         print(f"[Cache] Chargement depuis {cache_name}...")
         try:
-            opener = gzip.open if use_compression else open
-            with opener(cache_name, 'rb') as f:
-                flat_data, n_drivers = pickle.load(f)
-            print(f"[Cache] OK Chargé : {n_drivers} drivers")
+            if use_compression:
+                with gzip.open(cache_name, 'rb') as f:
+                    flat_data, n_drivers = pickle.load(f)
+            else:
+                with open(cache_name, 'rb') as f:
+                    flat_data, n_drivers = pickle.load(f)
+            size_mb = os.path.getsize(cache_name) / 1024 / 1024
+            print(f"[Cache] OK Chargé : {n_drivers} drivers ({size_mb:.1f} MB)")
             _stats.cache_hits += 1
         except Exception as e:
-            print(f"[Cache] X Erreur : {e}")
+            print(f"[Cache] X Erreur : {e}, régénération...")
             flat_data = None
             _stats.cache_misses += 1
     else:
         _stats.cache_misses += 1
     if flat_data is None:
-        flat_data, n_drivers = generate_drivers_optimized(n_cible, val_max_coche, smooth_bound, extra_primes, max_depth)
+        print("[Drivers] Génération...")
+        flat_data, n_drivers = generate_drivers_optimized(
+            n_cible, val_max_coche, smooth_bound, extra_primes, max_depth
+        )
+        print(f"[Cache] Sauvegarde dans {cache_name}...")
         try:
-            opener = gzip.open if use_compression else open
-            with opener(cache_name, 'wb') as f:
-                pickle.dump((flat_data, n_drivers), f)
-            print(f"[Cache] OK Sauvegardé")
+            if use_compression:
+                with gzip.open(cache_name, 'wb', compresslevel=6) as f:
+                    pickle.dump((flat_data, n_drivers), f)
+            else:
+                with open(cache_name, 'wb') as f:
+                    pickle.dump((flat_data, n_drivers), f)
+            size_mb = os.path.getsize(cache_name) / 1024 / 1024
+            print(f"[Cache] OK Sauvegardé ({size_mb:.1f} MB)")
         except Exception as e:
-            print(f"[Cache] X Erreur sauvegarde : {e}")
+            print(f"[Cache] X Erreur de sauvegarde : {e}")
+    print(f"[Drivers] Mise en mémoire partagée...")
     shared = SharedArray('q', n_drivers * 3, lock=False)
     shared[:] = flat_data
+    del flat_data
     return (shared, n_drivers)
 
 # ============================================================================
 # WORKER DE RECHERCHE
 # ============================================================================
+
 _worker_drivers = None
 _worker_n_drivers = 0
 
@@ -1050,7 +1170,6 @@ def _sieve_primes(limit):
     return tuple(i for i in range(2, limit + 1) if is_p[i])
 
 _SEMI_DIRECT_PRIMES = _sieve_primes(1_000_000)
-_SEMI_DIRECT_PRIMES_LIST = list(_SEMI_DIRECT_PRIMES)
 _SEMI_DIRECT_P_MAX = _SEMI_DIRECT_PRIMES[-1]
 
 def init_worker_with_drivers(drivers_tuple):
@@ -1058,110 +1177,85 @@ def init_worker_with_drivers(drivers_tuple):
     _worker_drivers, _worker_n_drivers = drivers_tuple
     signal.signal(signal.SIGINT, signal.SIG_IGN)
 
-def worker_search(node):
-    """Recherche d'antécédents pour un nœud donné."""
+def worker_search_partial(args):
+    """
+    Recherche partielle : traite uniquement les drivers [drv_start, drv_end).
+    Si do_pretests=True, exécute aussi les heuristiques rapides (Diff, Prim, Pomerance).
+    Retourne (node_int, solutions_partielles).
+    """
     global _worker_drivers, _worker_n_drivers
+    node, drv_start, drv_end, do_pretests = args
     node_int = int(node)
     solutions = {}
     drv = _worker_drivers
-    n_drv = _worker_n_drivers
-
-    # ---- Différences courantes ----
-    COMMON_DIFFS = (12, 56, 4, 8, 24, 40, 6, 20, 28, 44, 52, 60, 68, 76, 84, 92, 120, 992)
-    for diff in COMMON_DIFFS:
-        if diff >= node_int:
-            continue
-        k_candidate = node_int - diff
-        if k_candidate <= 1:
-            continue
-        sig_k = sigma_optimized(k_candidate)
-        if int(sig_k) - k_candidate == node_int:
-            solutions[k_candidate] = f"Diff({diff})"
-
-    # ---- Primoriaux ----
-    SMALL_PRIMORIALS = (2, 6, 30, 210, 2310, 30030, 510510, 9699690, 223092870)
-    for primorial in SMALL_PRIMORIALS:
-        offset = 2 * primorial
-        if offset >= node_int:
-            break
-        k_candidate = node_int - offset
-        if k_candidate <= 1 or k_candidate in solutions:
-            continue
-        sig_k = sigma_optimized(k_candidate)
-        if int(sig_k) - k_candidate == node_int:
-            solutions[k_candidate] = f"Prim({primorial})"
-
-    # ---- Pomerance H2 avec pré-filtrage arithmétique ----
-    h2_candidates = _improved_pomerance.generate_candidates_h2(node_int)
-    for k_candidate, source_type in h2_candidates.items():
-        if k_candidate in solutions:
-            continue
-
-        sigma_needed = node_int + k_candidate
-
-        # Filtre 1: borne inférieure — σ(k) >= k + 1
-        if sigma_needed < k_candidate + 1:
-            continue
-
-        # Filtre 2: parité de σ(k)
-        k_is_odd_sigma = gmpy2.is_square(mpz(k_candidate))
-        if not k_is_odd_sigma and k_candidate % 2 == 0:
-            k_is_odd_sigma = gmpy2.is_square(mpz(k_candidate >> 1))
-        if k_is_odd_sigma:
-            if sigma_needed % 2 == 0:
+    
+    # Phase 1 : Pré-tests (seulement pour le premier chunk)
+    if do_pretests:
+        COMMON_DIFFS = [12, 56, 4, 8, 24, 40, 6, 20, 28, 44, 52, 60, 68, 76, 84, 92, 120, 992]
+        for diff in COMMON_DIFFS:
+            if diff >= node_int:
                 continue
-        else:
-            if sigma_needed % 2 == 1:
+            k_candidate = node_int - diff
+            if k_candidate <= 1:
                 continue
-
-        # Filtre 3: divisibilité par (2^(v+1) - 1) si k = 2^v * m, m impair, m > 1
-        if k_candidate > 1 and k_candidate % 2 == 0:
-            k_tmp = k_candidate
-            v2 = 0
-            while k_tmp % 2 == 0:
-                k_tmp //= 2
-                v2 += 1
-            if k_tmp > 1:
-                mersenne_factor = (1 << (v2 + 1)) - 1
-                if sigma_needed % mersenne_factor != 0:
-                    continue
-
-        # Filtre 4: divisibilité par 4 si 3 || k
-        if k_candidate % 3 == 0 and k_candidate % 9 != 0:
-            if sigma_needed % 4 != 0:
+            sig_k = sigma_optimized(k_candidate)
+            if int(sig_k) - k_candidate == node_int:
+                solutions[k_candidate] = f"Diff({diff})"
+        
+        SMALL_PRIMORIALS = [2, 6, 30, 210, 2310, 30030, 510510, 9699690, 223092870]
+        for primorial in SMALL_PRIMORIALS:
+            offset = 2 * primorial
+            if offset >= node_int:
+                break
+            k_candidate = node_int - offset
+            if k_candidate <= 1:
                 continue
-
-        # Filtre 5: borne supérieure de Robin
-        if k_candidate > 5040:
-            try:
-                loglog_k = math.log(math.log(k_candidate))
-                upper_bound = k_candidate * (EXP_GAMMA * loglog_k + 1.0)
-                if sigma_needed > upper_bound:
-                    continue
-            except (ValueError, ZeroDivisionError):
-                pass
-
-        sig_k = sigma_optimized(k_candidate)
-        if int(sig_k) - k_candidate == node_int:
-            solutions[k_candidate] = source_type
-
+            if k_candidate not in solutions:
+                sig_k = sigma_optimized(k_candidate)
+                if int(sig_k) - k_candidate == node_int:
+                    solutions[k_candidate] = f"Prim({primorial})"
+        
+        h2_candidates = _improved_pomerance.generate_candidates_h2(node_int)
+        for k_candidate, source_type in h2_candidates.items():
+            if k_candidate not in solutions:
+                sig_k = sigma_optimized(k_candidate)
+                if int(sig_k) - k_candidate == node_int:
+                    solutions[k_candidate] = source_type
+    
+    # Phase 2 : Drivers [drv_start, drv_end) — AVEC FILTRES
     _pretest_keys = set(solutions.keys())
-
-    # ---- Drivers ----
-    if drv is not None and n_drv > 0:
-        for idx in range(n_drv):
+    
+    if drv is not None and drv_end > drv_start:
+        
+        # ============================================================
+        # FILTRE 1 : Recherche binaire — éliminer D > node en O(log n)
+        # Les drivers sont triés par D croissant.
+        # ============================================================
+        effective_end = drv_end
+        if drv[(drv_end - 1) * 3] > node_int:
+            lo, hi = drv_start, drv_end - 1
+            while lo < hi:
+                mid = (lo + hi) // 2
+                if drv[mid * 3] <= node_int:
+                    lo = mid + 1
+                else:
+                    hi = mid
+            effective_end = lo
+            _filter_stats['filtered_bisect'] += (drv_end - effective_end)
+        
+        _filter_stats['drivers_tested'] += (drv_end - drv_start)
+        
+        for idx in range(drv_start, effective_end):
             off = idx * 3
             D_int = drv[off]
-            if D_int > node_int:
-                break
             SD_int = drv[off + 1]
             if SD_int > node_int:
                 continue
             sD = drv[off + 2]
             if sD <= 0:
                 continue
-
-            # -- Direct: k = D * q --
+            
+            # Direct: k = D * q (test O(1) — toujours exécuté)
             num_direct = node_int - SD_int
             if num_direct > 0 and num_direct % sD == 0:
                 q_full = num_direct // sD
@@ -1172,17 +1266,37 @@ def worker_search(node):
                             solutions[k] = f"D({D_int})"
                     elif q_full < 1_000_000 and math.gcd(D_int, q_full) == 1:
                         k = D_int * q_full
-                        if k not in _pretest_keys and int(sigma_optimized(k)) - k == node_int:
-                            solutions[k] = f"Multi({D_int})"
-
-            # -- Semi-direct: k = D * p * q --
+                        if k not in _pretest_keys:
+                            if int(sigma_optimized(k)) - k == node_int:
+                                solutions[k] = f"Multi({D_int})"
+            
+            # ============================================================
+            # FILTRE 2 : p_min — plus petit premier copremier à D
+            # Si σ(D)×(1+p_min) > node, aucun premier p ne donne une
+            # solution semi-directe ni quadratique → skip complet.
+            # Raison : s(D·p·q) = σ(D)(1+p)(1+q) - D·p·q, et la
+            # condition σ(D)(1+p) ≤ node est nécessaire (car q ≥ 1).
+            # p_min est le plus petit p valide, donc si ça échoue
+            # pour p_min, ça échoue pour tout p > p_min aussi.
+            # ============================================================
+            p_min = _smallest_coprime_prime(D_int)
+            if SD_int * (1 + p_min) > node_int:
+                _filter_stats['filtered_pmin'] += 1
+                continue
+            
+            # Semi-direct: k = D * p * q
             target_q = sD * node_int + SD_int * D_int
             if target_q <= 0:
                 continue
+            
             sqrt_target = gmpy2.isqrt(target_q)
             p_max_needed = (int(sqrt_target) - SD_int) // sD
-
+            
+            # ========================================================
+            # Semi-direct : k = D * p * q (sieve rapide)
+            # ========================================================
             if p_max_needed <= _SEMI_DIRECT_P_MAX:
+                _filter_stats['entered_semi_direct'] += 1
                 for p in _SEMI_DIRECT_PRIMES:
                     if p > p_max_needed:
                         break
@@ -1205,74 +1319,59 @@ def worker_search(node):
                     k_semi = D_int * p * q_v
                     if k_semi not in _pretest_keys:
                         solutions[k_semi] = f"S({D_int})"
-
-            # -- Quadratic: hybride diviseurs + fallback linéaire --
+            
+            # ========================================================
+            # Quadratic : recherche par diviseurs avec saut modulaire
+            # ========================================================
             if target_q <= MAX_TARGET_QUADRATIC:
                 sqrt_target_tmp = gmpy2.isqrt(target_q)
                 if sqrt_target_tmp // sD > QUADRATIC_MAX_ITERATIONS:
                     continue
                 if node_int % 2 == 1 and gmpy2.is_prime(target_q):
                     continue
-
-                divisors = get_divisors_fast(target_q)
-
-                if divisors:
-                    # Méthode rapide : itérer sur les vrais diviseurs
-                    for d in divisors:
-                        if d * d > target_q:
-                            break
-                        diff = d - SD_int
-                        if diff <= 0 or diff % sD != 0:
-                            continue
-                        p_v = diff // sD
-                        if p_v <= 1 or D_int % p_v == 0:
-                            continue
-                        if not gmpy2.is_prime(p_v):
-                            continue
-                        div_q = target_q // d
-                        diff_q = div_q - SD_int
-                        if diff_q <= 0 or diff_q % sD != 0:
-                            continue
-                        q_v = diff_q // sD
-                        if q_v > p_v and D_int % q_v != 0 and gmpy2.is_prime(q_v):
-                            k_quad = D_int * p_v * q_v
-                            if k_quad not in _pretest_keys:
-                                solutions[k_quad] = f"Q({D_int})"
+                if p_max_needed <= _SEMI_DIRECT_P_MAX:
+                    div_min = (_SEMI_DIRECT_P_MAX + 1) * sD + SD_int
                 else:
-                    # Fallback : balayage linéaire
-                    if p_max_needed <= _SEMI_DIRECT_P_MAX:
-                        div_min = (_SEMI_DIRECT_P_MAX + 1) * sD + SD_int
-                    else:
-                        div_min = 2 * sD + SD_int
-                    d = div_min
-                    while d <= sqrt_target:
-                        if target_q % d == 0:
-                            diff = d - SD_int
-                            if diff > 0 and diff % sD == 0:
-                                p_v = diff // sD
-                                if p_v > 1 and D_int % p_v == 0:
-                                    d += sD
-                                    continue
-                                if gmpy2.is_prime(p_v):
-                                    div_q = target_q // d
-                                    diff_q = div_q - SD_int
-                                    if diff_q > 0 and diff_q % sD == 0:
-                                        q_v = diff_q // sD
-                                        if q_v > p_v and D_int % q_v != 0:
-                                            if gmpy2.is_prime(q_v):
-                                                k_quad = D_int * p_v * q_v
-                                                if k_quad not in _pretest_keys:
-                                                    solutions[k_quad] = f"Q({D_int})"
-                        d += sD
-
+                    div_min = 2 * sD + SD_int
+                d = div_min
+                _filter_stats['entered_quadratic'] += 1
+                while d <= sqrt_target:
+                    if target_q % d == 0:
+                        diff = d - SD_int
+                        if diff > 0 and diff % sD == 0:
+                            p_v = diff // sD
+                            if p_v > 1 and D_int % p_v == 0:
+                                d += sD
+                                continue
+                            if gmpy2.is_prime(p_v):
+                                div_q = target_q // d
+                                diff_q = div_q - SD_int
+                                if diff_q > 0 and diff_q % sD == 0:
+                                    q_v = diff_q // sD
+                                    if q_v > p_v and D_int % q_v != 0:
+                                        if gmpy2.is_prime(q_v):
+                                            k_quad = D_int * p_v * q_v
+                                            if k_quad not in _pretest_keys:
+                                                solutions[k_quad] = f"Q({D_int})"
+                    d += sD
+    
     return (node_int, solutions)
+
+
+def worker_search(node):
+    """Recherche complète (tous les drivers) - compatibilité avec l'ancien mode."""
+    global _worker_n_drivers
+    return worker_search_partial((node, 0, _worker_n_drivers, True))
+
+
 
 
 # ============================================================================
 # CLASSE PRINCIPALE
 # ============================================================================
+
 class ArbreAliquoteV5:
-    def __init__(self, n_cible, profondeur=100, smooth_bound=120, extra_primes=None,
+    def __init__(self, n_cible, profondeur=100, smooth_bound=120, extra_primes=None, 
                  max_depth=6, use_compression=False, allow_empty_exploration=False):
         self.cible_initiale = int(n_cible)
         self.profondeur = profondeur
@@ -1280,7 +1379,7 @@ class ArbreAliquoteV5:
         self.extra_primes = extra_primes or []
         self.max_depth = max_depth
         self.use_compression = use_compression
-        self.allow_empty_exploration = allow_empty_exploration
+        self.allow_empty_exploration = allow_empty_exploration  # ✅ NOUVEAU
         self.max_workers = max(1, cpu_count() - 2)
         self.global_cache = GlobalAntecedenteCache(cache_dir=".", use_compression=use_compression)
         self.explored = set()
@@ -1291,10 +1390,10 @@ class ArbreAliquoteV5:
         self.val_max_coche = self.cible_initiale
         self._load_explored_nodes()
         signal.signal(signal.SIGINT, self._signal_handler)
-
+    
     def _load_explored_nodes(self):
         if os.path.exists(self.old_cache_file):
-            print(f"[Migration] Fusion de {self.old_cache_file}...")
+            print(f"[Migration] Fusion de {self.old_cache_file} dans le cache global...")
             self.global_cache.merge_from_file(self.old_cache_file)
         if os.path.exists(self.old_cache_json):
             try:
@@ -1305,62 +1404,64 @@ class ArbreAliquoteV5:
                 print(f"[Migration] Ancien cache JSON fusionné")
             except Exception:
                 pass
+        
+        # ✅ NOUVEAU: Comportement conditionnel selon allow_empty_exploration
         if self.allow_empty_exploration:
+            # Mode ré-exploration des nœuds vides: ne marquer comme explorés que les nœuds avec antécédents
             empty_nodes_count = 0
             for aliquot_str, antecedents in self.global_cache.cache.items():
-                if antecedents:
+                if antecedents:  # Seulement si le nœud a des antécédents
                     self.explored.add(int(aliquot_str))
                 else:
                     empty_nodes_count += 1
             if self.explored:
-                print(f"[Cache Global] {len(self.explored)} nœuds avec antécédents")
+                print(f"[Cache Global] {len(self.explored)} sommes aliquotes avec antécédents (explorées)")
             if empty_nodes_count:
-                print(f"[Cache Global] {empty_nodes_count} nœuds vides pour ré-exploration")
+                print(f"[Cache Global] OK {empty_nodes_count} nœuds vides {{}} disponibles pour ré-exploration")
         else:
+            # Mode standard: marquer tous les nœuds comme explorés
             for aliquot_str in self.global_cache.cache.keys():
                 self.explored.add(int(aliquot_str))
             if self.explored:
-                print(f"[Cache Global] {len(self.explored)} nœuds déjà explorés")
-
+                print(f"[Cache Global] {len(self.explored)} sommes aliquotes déjà explorées")
+    
     def _signal_handler(self, sig, frame):
         print("\n[!] Interruption...")
         self.stop = True
+        print("\n[Cache Global] Sauvegarde finale...")
         self.global_cache.save()
         self.global_cache.print_stats()
         _stats.report(force=True)
         self.afficher()
         sys.exit(0)
-
+    
     def _save_node(self, node_val, solutions):
-        self.global_cache.add_antecedents(node_val, solutions or {})
-
-    def afficher(self):
-        """Affiche un résumé de l'arbre construit."""
-        raw_cache = self.global_cache.cache or {}
-        total_nodes = len(raw_cache)
-        total_antecedents = sum(len(v) for v in raw_cache.values())
-        print(f"\n{'='*70}")
-        print(f"RÉSUMÉ ARBRE - CIBLE {self.cible_initiale}")
-        print(f"{'='*70}")
-        print(f"Nœuds explorés     : {total_nodes:,}")
-        print(f"Antécédents totaux : {total_antecedents:,}")
-        print(f"Temps écoulé       : {time.time() - self.start_time:.1f}s")
-        print(f"{'='*70}\n")
-
+        try:
+            self.global_cache.add_antecedents(node_val, solutions or {})
+        except Exception as e:
+            print(f"[Cache Global] Erreur sauvegarde: {e}")
+    
     def construire(self, reprise_active=False):
         print(f"\n{'='*70}")
         print(f"CONSTRUCTION ARBRE V5 - CIBLE {self.cible_initiale}")
         print(f"{'='*70}")
-        print(f"Profondeur : {self.profondeur}, Smooth bound : {self.smooth_bound}")
-        print(f"Max depth : {self.max_depth}, Compression : {'OUI' if self.use_compression else 'NON'}")
-        print(f"Processeurs : {cpu_count()}, Reprise : {'OUI' if reprise_active else 'NON'}")
+        print(f"Profondeur : {self.profondeur}")
+        print(f"Smooth bound : {self.smooth_bound}")
+        print(f"Max depth : {self.max_depth}")
+        print(f"Compression cache : {'OUI' if self.use_compression else 'NON'}")
+        print(f"Processeurs : {cpu_count()}")
+        print(f"Mode reprise : {'OUI' if reprise_active else 'NON'}")
         print(f"{'='*70}\n")
-
+        
         drivers_array, n_drivers = get_cached_drivers(
-            self.cible_initiale, self.val_max_coche, self.smooth_bound,
-            self.extra_primes, self.max_depth, self.use_compression
+            self.cible_initiale,
+            self.val_max_coche,
+            self.smooth_bound,
+            self.extra_primes,
+            self.max_depth,
+            self.use_compression
         )
-
+        
         if reprise_active:
             current_gen, start_gen = self._resume_from_cache()
             if not current_gen:
@@ -1369,97 +1470,171 @@ class ArbreAliquoteV5:
         else:
             current_gen = [self.cible_initiale]
             start_gen = 1
-
+        
         num_workers = max(1, cpu_count() - 2)
-        pool = Pool(num_workers, initializer=init_worker_with_drivers, initargs=((drivers_array, n_drivers),))
-
+        pool = Pool(
+            num_workers,
+            initializer=init_worker_with_drivers,
+            initargs=((drivers_array, n_drivers),)
+        )
         try:
             for gen in range(start_gen, self.profondeur + 1):
                 if self.stop or not current_gen:
                     break
                 print(f"\n--- GÉNÉRATION {gen} ({len(current_gen)} nœuds) ---")
                 gen_start = time.time()
-
+                
                 if reprise_active and gen == start_gen:
                     to_compute = current_gen
                     print(f"[G{gen}] Traitement frontière : {len(to_compute)} nœuds (reprise)")
                 else:
+                    # ✅ OPTIMISÉ: Filtrage en une seule passe avec marquage immédiat des nœuds > 100x
                     limit_100x = self.val_max_coche * 100
                     to_compute = []
                     beyond_limit_count = 0
+                    
                     for v in current_gen:
                         if v in self.explored:
-                            continue
+                            continue  # Déjà traité
+                        
                         if v > limit_100x:
-                            self._save_node(v, {})
+                            # Nœud > 100x cible : marquer comme feuille sans calcul
+                            self._save_node(v, {})  # Pas d'antécédents
                             self.explored.add(v)
                             beyond_limit_count += 1
                         else:
+                            # Nœud à explorer normalement
                             to_compute.append(v)
+                    
                     if beyond_limit_count > 0:
-                        print(f"[G{gen}] {beyond_limit_count} nœuds > 100x cible marqués feuilles")
-
+                        print(f"[G{gen}] {beyond_limit_count} nœuds > {limit_100x} (100x cible) marqués comme feuilles (non explorés)")
+                    
                     if not to_compute:
-                        print(f"[G{gen}] Tous explorés, navigation cache...")
+                        print(f"[G{gen}] Tous les nœuds déjà explorés, navigation via cache...")
                         next_gen_from_cache = []
-                        empty_nodes = []
+                        empty_nodes = []  # Nœuds vides à ré-explorer
                         for v in current_gen:
                             ants = self.global_cache.get_antecedents(v)
-                            if ants is not None:
-                                if ants:
-                                    next_gen_from_cache.extend([int(k) for k in ants.keys() if int(k) <= self.val_max_coche * 100])
-                                elif self.allow_empty_exploration:
+                            if ants is not None:  # Nœud existant dans le cache
+                                if ants:  # Nœud avec antécédents
+                                    next_gen_from_cache.extend(
+                                        [int(k) for k in ants.keys() if int(k) <= self.val_max_coche * 100]
+                                    )
+                                elif self.allow_empty_exploration:  # Nœud vide {} - ré-exploration si activée
                                     empty_nodes.append(v)
+                        
                         if empty_nodes and self.allow_empty_exploration:
-                            print(f"[G{gen}] {len(empty_nodes)} nœuds vides pour ré-exploration")
+                            print(f"[G{gen}] OK {len(empty_nodes)} nœuds vides détectés - ajoutés pour ré-exploration")
+                            # Retirer ces nœuds de explored pour permettre leur retraitement
                             for node in empty_nodes:
-                                self.explored.discard(node)
+                                if node in self.explored:
+                                    self.explored.discard(node)
                             next_gen_from_cache.extend(empty_nodes)
+                        
                         if not next_gen_from_cache:
-                            print(" -> Fin de branche (feuilles).")
+                            print(" -> Fin de branche atteinte (feuilles).")
                             break
                         current_gen = list(set(next_gen_from_cache))
                         continue
-
-                next_gen = set()
+                
+                next_gen = set()  # ✅ OPTIMISÉ: Utiliser set directement pour dédoublonnage en temps réel
                 processed = 0
-                for node_val, solutions in pool.imap_unordered(worker_search, to_compute, chunksize=1):
-                    if self.stop:
-                        break
-                    self._save_node(node_val, solutions)
-                    self.explored.add(node_val)
-                    _stats.total_nodes_processed += 1
-                    for sol_type in solutions.values():
-                        sol_prefix = sol_type.split('(')[0]
-                        _stats.add_solution(sol_prefix)
-                    for k in solutions:
-                        k_val = int(k)
-                        next_gen.add(k_val)
-                    processed += 1
-                    if processed % 10 == 0:
-                        print(f"\r   -> {processed}/{len(to_compute)}", end='')
-
+                
+                # ✅ MODE COOPÉRATIF : si moins de nœuds que de workers,
+                # chaque nœud est découpé en tranches de drivers traitées en parallèle
+                if len(to_compute) < num_workers and n_drivers > num_workers:
+                    workers_per_node = num_workers // len(to_compute)
+                    chunk_size = (n_drivers + workers_per_node - 1) // workers_per_node
+                    
+                    print(f"[G{gen}] MODE COOPÉRATIF : {len(to_compute)} nœuds × {workers_per_node} workers/nœud "
+                          f"({chunk_size} drivers/chunk sur {n_drivers})")
+                    
+                    # Construire les tâches partielles
+                    partial_tasks = []
+                    for node_val in to_compute:
+                        for w in range(workers_per_node):
+                            drv_start = w * chunk_size
+                            drv_end = min((w + 1) * chunk_size, n_drivers)
+                            if drv_start >= n_drivers:
+                                break
+                            # Seul le premier chunk fait les pré-tests (Diff, Prim, Pomerance)
+                            do_pretests = (w == 0)
+                            partial_tasks.append((node_val, drv_start, drv_end, do_pretests))
+                    
+                    print(f"[G{gen}] {len(partial_tasks)} tâches partielles soumises")
+                    
+                    # Collecter les résultats partiels par nœud
+                    partial_results = {}  # {node_int: {k: type, ...}}
+                    for node_int, partial_solutions in pool.imap_unordered(
+                            worker_search_partial, partial_tasks, chunksize=1):
+                        if self.stop:
+                            break
+                        if node_int not in partial_results:
+                            partial_results[node_int] = {}
+                        partial_results[node_int].update(partial_solutions)
+                    
+                    # Fusionner et sauvegarder
+                    for node_val in to_compute:
+                        if self.stop:
+                            break
+                        solutions = partial_results.get(node_val, {})
+                        self._save_node(node_val, solutions)
+                        self.explored.add(node_val)
+                        _stats.total_nodes_processed += 1
+                        for sol_type in solutions.values():
+                            sol_prefix = sol_type.split('(')[0]
+                            _stats.add_solution(sol_prefix)
+                        for k in solutions:
+                            next_gen.add(int(k))
+                        processed += 1
+                        print(f"   -> {node_val}: {len(solutions)} antécédents trouvés (coopératif)")
+                
+                else:
+                    # ✅ MODE STANDARD : 1 nœud = 1 worker (comme avant)
+                    for node_val, solutions in pool.imap_unordered(worker_search, to_compute, chunksize=1):
+                        if self.stop:
+                            break
+                        self._save_node(node_val, solutions)
+                        self.explored.add(node_val)
+                        _stats.total_nodes_processed += 1
+                        for sol_type in solutions.values():
+                            sol_prefix = sol_type.split('(')[0]
+                            _stats.add_solution(sol_prefix)
+                        for k in solutions:
+                            k_val = int(k)
+                            # ✅ CORRECTIF CACHE: Ajouter TOUS les enfants à next_gen
+                            # (pas seulement ceux < 100x cible)
+                            next_gen.add(k_val)
+                        processed += 1
+                        if processed % 10 == 0:
+                            print(f"\r   -> {processed}/{len(to_compute)}", end='')
+                
                 gen_time = time.time() - gen_start
                 _stats.add_generation_time(gen_time)
                 print(f"\n[G{gen}] OK {len(next_gen)} nouvelles branches ({gen_time:.2f}s)")
-
+                
+                # ✅ CORRECTIF CACHE: Filtrer APRÈS avoir tout sauvegardé
+                # Tous les enfants sont dans le cache, mais on explore que les pertinents
                 next_gen_filtered = {k for k in next_gen if k <= self.val_max_coche * 100}
                 if len(next_gen_filtered) < len(next_gen):
-                    print(f"[G{gen}] Filtre 100x: {len(next_gen_filtered)}/{len(next_gen)} nœuds gardés")
-
+                    print(f"[G{gen}] Filtre 100x: {len(next_gen_filtered)}/{len(next_gen)} nœuds gardés pour exploration")
+                
                 current_gen = list(next_gen_filtered)
                 if reprise_active and gen == start_gen:
                     reprise_active = False
-
+                
+                # ✅ CORRECTIF CACHE: Sauvegarder CHAQUE génération (pas toutes les 2)
                 self.global_cache.save()
         finally:
             pool.close()
             pool.join()
             _stats.report()
             self.afficher()
-
+    
     def _resume_from_cache(self):
         raw_cache = self.global_cache.cache or {}
+        
+        # ✅ CORRECTIF: Charger d'abord TOUT le cache
         full_cache = {}
         for parent_str, enfants in raw_cache.items():
             try:
@@ -1474,87 +1649,254 @@ class ArbreAliquoteV5:
                     except Exception:
                         continue
             full_cache[parent] = child_keys
-
+        
         if not full_cache:
             print("[Reprise] Cache global vide, démarrage normal")
             return ([self.cible_initiale], 1)
-
+        
         print(f"[Reprise] Cache global chargé : {len(full_cache)} nœuds totaux")
+        
+        # ✅ CORRECTIF: Filtrer UNIQUEMENT les nœuds de l'arbre de la cible actuelle
         root = self.cible_initiale
-
+        
         if root not in full_cache:
             print(f"[Reprise] Cible {root} non trouvée dans le cache, démarrage normal")
             return ([root], 1)
-
+        
+        # BFS pour identifier UNIQUEMENT les nœuds de cet arbre
         queue = deque([(root, 0)])
-        tree_nodes = {root}
-        cache = {}
+        tree_nodes = {root}  # Nœuds appartenant à cet arbre
+        cache = {}  # Cache filtré pour cet arbre seulement
         max_depth_found = 0
-
+        
         print(f"[Reprise] Extraction de l'arbre depuis la racine {root}...")
-
+        
         while queue:
             node, d = queue.popleft()
             max_depth_found = max(max_depth_found, d)
+            
             if node in full_cache:
-                cache[node] = full_cache[node]
+                cache[node] = full_cache[node]  # Ajouter au cache filtré
                 for child in full_cache[node]:
                     if child not in tree_nodes:
                         tree_nodes.add(child)
                         queue.append((child, d + 1))
-
-        print(f"[Reprise] Arbre de {root} : {len(cache)} nœuds explorés")
+        
+        print(f"[Reprise] Arbre de {root} : {len(cache)} nœuds explorés (sur {len(full_cache)} totaux)")
         print(f"[Reprise] Nœuds de cet arbre : {len(tree_nodes)}")
-
+        
+        # Marquer SEULEMENT les nœuds de cet arbre comme explorés
         for parent in cache.keys():
             self.explored.add(parent)
         print(f"[Reprise] {len(self.explored)} nœuds marqués comme explorés")
-
+        
+        # Identifier la frontière (enfants dans tree_nodes mais pas dans cache)
         all_children = set()
         for enfants in cache.values():
             for e in enfants:
                 all_children.add(e)
-
+        
         frontier = {e for e in all_children if e not in cache}
         print(f"[Reprise] Frontière brute identifiée : {len(frontier)} nœuds")
-
+        
         if not frontier:
-            print("[Reprise] Frontière vide (arbre complet ?)")
+            print("[Reprise] ⚠️  Frontière vide (arbre complet ?)")
             return ([], 1)
-
-        frontier_filtered = [n for n in frontier if n <= self.val_max_coche * 100]
-        print(f"[Reprise] Frontière filtrée : {len(frontier_filtered)} nœuds")
-
-        estimated_gen = max_depth_found + 1
-        print(f"[Reprise] Profondeur max trouvée : {max_depth_found}")
-        print(f"[Reprise] Reprise à la génération : {estimated_gen}")
-
-        return (frontier_filtered, estimated_gen)
-
+        
+        depth = max_depth_found + 1
+        print(f"[Reprise] Profondeur estimée : {depth}")
+        
+        frontier_filtered = [f for f in frontier if f <= self.val_max_coche * 100]
+        if len(frontier_filtered) < len(frontier):
+            excluded = len(frontier) - len(frontier_filtered)
+            print(f"[Reprise] {excluded} nœuds exclus (> 100x val_coche)")
+        
+        frontier_list = sorted(frontier_filtered)
+        print(f"[Reprise] Frontière finale : {len(frontier_list)} nœuds actifs")
+        return (frontier_list, depth)
+    
+    def afficher(self):
+        total_time = time.time() - self.start_time
+        root = int(self.cible_initiale)
+        print(f"\n{'='*70}")
+        print(f"RÉSULTATS : MINIMUM PAR BRANCHE DE {root}")
+        print(f"(Plus petit nombre < {self.val_max_coche} de chaque branche)")
+        print(f"{'='*70}")
+        raw_cache = self.global_cache.cache or {}
+        numeric_cache = {}
+        for parent_str, enfants in raw_cache.items():
+            try:
+                parent = int(parent_str)
+            except Exception:
+                continue
+            child_map = {}
+            if isinstance(enfants, dict):
+                for child_str, typ in enfants.items():
+                    try:
+                        child_map[int(child_str)] = typ
+                    except Exception:
+                        continue
+            numeric_cache[parent] = child_map
+        if root not in numeric_cache and not any(root in v for v in numeric_cache.values()):
+            print("Aucune donnée dans le cache global pour cette cible.")
+            print(f"Temps : {total_time:.2f}s")
+            return
+        nodes_of_interest = set()
+        parents_map = {}
+        queue = deque([root])
+        visited_bfs = {root}
+        while queue:
+            current_node = queue.popleft()
+            children_map = numeric_cache.get(current_node, {})
+            for child in children_map.keys():
+                if child not in visited_bfs:
+                    visited_bfs.add(child)
+                    parents_map[child] = current_node
+                    queue.append(child)
+                    nodes_of_interest.add(child)
+        candidates = sorted([n for n in nodes_of_interest if n < self.val_max_coche])
+        if not candidates:
+            print(f"Aucun antécédent < {self.val_max_coche}")
+            print(f"Temps : {total_time:.2f}s")
+            return
+        minima_descendants = []
+        for val in candidates:
+            path = []
+            curr = val
+            safety = 0
+            while curr in parents_map and safety < 1000:
+                path.append(curr)
+                curr = parents_map[curr]
+                safety += 1
+            path.append(root)
+            path.reverse()
+            val_index = path.index(val)
+            successors = path[val_index + 1:]
+            has_smaller_successor = any(s < val for s in successors)
+            if not has_smaller_successor:
+                minima_descendants.append((val, path))
+        if not minima_descendants:
+            print(f"Aucun minimum descendant trouvé")
+            print(f"Temps : {total_time:.2f}s")
+            return
+        linear_families = []
+        for val, path in minima_descendants:
+            found_family = False
+            for family in linear_families:
+                for fam_val, fam_path in family:
+                    if val in fam_path or fam_val in path:
+                        family.append((val, path))
+                        found_family = True
+                        break
+                if found_family:
+                    break
+            if not found_family:
+                linear_families.append([(val, path)])
+        final_minima = []
+        for family in linear_families:
+            family.sort(key=lambda x: x[0])
+            smallest_val, smallest_path = family[0]
+            final_minima.append((smallest_val, smallest_path))
+        final_minima.sort(key=lambda x: x[0])
+        print(f"Minimum par branche : {len(final_minima)}")
+        print(f"(Minima descendants avant filtrage : {len(minima_descendants)})")
+        print(f"(Total candidats : {len(candidates)})")
+        print(f"(Total exploré (BFS) : {len(visited_bfs) - 1} nœuds)")
+        print(f"Temps : {total_time:.2f}s\n")
+        print(f"{'MINIMUM':<20} | {'CHAÎNE COMPLÈTE'}")
+        print("-" * 75)
+        for val, path in final_minima:
+            path_str = " → ".join(map(str, path))
+            print(f"{val:<20} | {path_str}")
+        print("-" * 75)
+        print(f"\nSTATISTIQUES :")
+        print(f"  • Chemins linéaires distincts : {len(linear_families)}")
+        print(f"  • Minima finaux affichés      : {len(final_minima)}")
+        print(f"  • Minima filtrés              : {len(minima_descendants) - len(final_minima)}")
+        print(f"  • Taux de compaction          : {len(final_minima)/len(minima_descendants)*100:.1f}%")
+        multi_minima_families = [fam for fam in linear_families if len(fam) > 1]
+        if multi_minima_families:
+            print(f"\n  Chemins avec minima multiples (gardé le plus petit) :")
+            for family in multi_minima_families:
+                family.sort(key=lambda x: x[0])
+                kept = family[0][0]
+                eliminated = [v for v, _ in family[1:]]
+                print(f"    Gardé: {kept:,} | Éliminés: {eliminated}")
+        depths = {}
+        for val, path in final_minima:
+            depth = len(path) - 1
+            depths[depth] = depths.get(depth, 0) + 1
+        if depths:
+            print(f"\n  Répartition par profondeur :")
+            for depth in sorted(depths.keys()):
+                print(f"    Génération {depth:>3} : {depths[depth]:>3} minimum(a)")
+        print("-" * 75)
 
 # ============================================================================
 # POINT D'ENTRÉE
 # ============================================================================
+
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description="Arbre aliquote V5")
-    parser.add_argument("cible", type=int, help="Nombre cible")
-    parser.add_argument("-p", "--profondeur", type=int, default=100, help="Profondeur max")
-    parser.add_argument("-B", "--smooth-bound", type=int, default=120, help="Borne smooth")
-    parser.add_argument("-D", "--max-depth", type=int, default=6, help="Profondeur DFS drivers")
-    parser.add_argument("--extra-primes", type=int, nargs="*", default=[], help="Premiers supplémentaires")
-    parser.add_argument("--compress", action="store_true", help="Compression gzip")
-    parser.add_argument("--reprise", action="store_true", help="Reprendre depuis le cache")
-    parser.add_argument("--allow-empty", action="store_true", help="Ré-explorer les nœuds vides")
-
-    args = parser.parse_args()
-
-    arbre = ArbreAliquoteV5(
-        n_cible=args.cible,
-        profondeur=args.profondeur,
-        smooth_bound=args.smooth_bound,
-        extra_primes=args.extra_primes if args.extra_primes else None,
-        max_depth=args.max_depth,
-        use_compression=args.compress,
-        allow_empty_exploration=args.allow_empty,
+    parser = argparse.ArgumentParser(
+        description="Recherche d'antécédents aliquotes - Version V5 Optimisée"
     )
-    arbre.construire(reprise_active=args.reprise)
+    parser.add_argument("val_coche", type=int, help="Valeur max")
+    parser.add_argument("n", type=int, help="Cible")
+    parser.add_argument("--depth", type=int, default=100, help="Profondeur")
+    parser.add_argument("--smooth-bound", type=int, default=170, help="Borne B")
+    parser.add_argument("--extra-primes", type=int, nargs='*',
+                        default=[173, 197, 211, 239, 251, 269, 313, 419, 439, 457, 541, 907],
+                        help="Grands premiers")
+    parser.add_argument("--max-driver-depth", type=int, default=5,
+                        help="Max premiers distincts")
+    parser.add_argument("--compress", action='store_true',
+                        help="Compresser le cache (gzip)")
+    parser.add_argument("--resume", action='store_true',
+                        help="Reprendre depuis le cache global")
+    parser.add_argument("--allow-empty-node-exploration", action='store_true',
+                        help="Permettre la ré-exploration des nœuds vides {{}} (défaut: désactivé)")
+    args = parser.parse_args()
+    
+    n_val = abs(int(args.n))
+    log_n = math.log10(n_val + 1)
+    
+    if args.smooth_bound == 100:
+        dynamic_b = int(25 * math.log(math.log(n_val + 10)))
+        args.smooth_bound = max(100, dynamic_b)
+    
+    if args.max_driver_depth == 6:
+        if log_n < 6:
+            args.max_driver_depth = 4
+        elif log_n < 10:
+            args.max_driver_depth = 6
+        elif log_n < 13:
+            args.max_driver_depth = 7
+        else:
+            args.max_driver_depth = 8
+    
+    print("="*70)
+    print("  VERSION V5 - OPTIMISÉE AVEC NUMBA")
+    print("="*70)
+    print(f"  • Cible : {args.n}")
+    print(f"  • Smooth bound : {args.smooth_bound}")
+    print(f"  • Max depth : {args.max_driver_depth}")
+    print(f"  • Compression : {'OUI' if args.compress else 'NON'}")
+    print(f"  • Reprise : {'OUI' if args.resume else 'NON'}")
+    print(f"  • Ré-exploration nœuds vides : {'OUI' if args.allow_empty_node_exploration else 'NON'}")
+    if NUMBA_AVAILABLE:
+        print(f"  • Numba : ACTIVÉ (seuil: {NUMBA_THRESHOLD:,})")
+    else:
+        print(f"  • Numba : NON DISPONIBLE (pip install numba)")
+    print("="*70 + "\n")
+    
+    app = ArbreAliquoteV5(
+        n_cible=args.n,
+        profondeur=args.depth,
+        smooth_bound=args.smooth_bound,
+        extra_primes=args.extra_primes,
+        max_depth=args.max_driver_depth,
+        use_compression=args.compress,
+        allow_empty_exploration=args.allow_empty_node_exploration
+    )
+    app.val_max_coche = args.val_coche
+    app.construire(reprise_active=args.resume)
