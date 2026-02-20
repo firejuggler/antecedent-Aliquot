@@ -42,6 +42,7 @@ import time
 import signal
 import argparse
 import json
+import hashlib
 import os
 import math
 import pickle
@@ -57,7 +58,7 @@ try:
     from numba import njit
     NUMBA_AVAILABLE = True
     # Seuil pour utiliser Numba vs gmpy2
-    NUMBA_THRESHOLD = 10**15  # Numba pour n < 10^15, gmpy2 pour n >= 10^15    
+    NUMBA_THRESHOLD = 10**12  # Numba pour n < 10^12, gmpy2 pour n >= 10^12
 except ImportError:
     NUMBA_AVAILABLE = False
     NUMBA_THRESHOLD = 0
@@ -144,8 +145,12 @@ def _powmod(base, exp, mod):
 def is_prime_numba(n):
     """
     Test de primalité Miller-Rabin DÉTERMINISTE optimisé pour Numba.
-    Garanti correct pour n < 3.317×10^24 avec 12 témoins.
-    Complexité O(k·log²n) au lieu de O(√n) pour la division d'essai.
+    Nombre de témoins adaptatif selon la taille de n :
+      - n < 2 047            : 1 témoin   (2)
+      - n < 1 373 653        : 2 témoins  (2, 3)
+      - n < 3 215 031 751    : 4 témoins  (2, 3, 5, 7)
+      - n < 3.317×10^24      : 12 témoins (2..37) — déterministe (Sorenson & Webster 2016)
+    Gain ~2x pour n < 10^9.
     """
     if n < 2:
         return False
@@ -168,14 +173,27 @@ def is_prime_numba(n):
         d //= 2
         r += 1
     
-    # Test avec 12 témoins (déterministe pour n < 3.317×10^24)
+    # Nombre de témoins adaptatif selon la taille de n
+    if n < 2047:
+        num_witnesses = 1
+    elif n < 1373653:
+        num_witnesses = 2
+    elif n < 3215031751:
+        num_witnesses = 4
+    else:
+        num_witnesses = 12
+    
+    witness_idx = 0
     for a in small_primes:
+        if witness_idx >= num_witnesses:
+            break
         if a >= n:
             continue
         
         x = _powmod(a, d, n)
         
         if x == 1 or x == n - 1:
+            witness_idx += 1
             continue
         
         composite = True
@@ -187,6 +205,7 @@ def is_prime_numba(n):
         
         if composite:
             return False
+        witness_idx += 1
     
     return True
 
@@ -827,7 +846,12 @@ def sigma_optimized(n):
                     temp_n //= p
                 total *= p_sum
         if temp_n > 1:
+            # Wheel mod 30: test 8/30 candidates instead of 15/30 with d += 2
+            # Residues coprime to 30: 1, 7, 11, 13, 17, 19, 23, 29
+            # Increments starting from residue 7: 4, 2, 4, 2, 4, 6, 2, 6
+            _wheel30 = (4, 2, 4, 2, 4, 6, 2, 6)
             d = mpz(101)
+            wi = 1  # d=101 (residue 11) -> increment +2 to get to 103 (residue 13)
             while d * d <= temp_n:
                 if temp_n % d == 0:
                     p_pow = d
@@ -838,7 +862,8 @@ def sigma_optimized(n):
                         p_sum += p_pow
                         temp_n //= d
                     total *= p_sum
-                d += 2
+                d += _wheel30[wi]
+                wi = (wi + 1) & 7
             if temp_n > 1:
                 total *= (mpz(1) + temp_n)
         result = total
@@ -1128,8 +1153,8 @@ def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, ex
     return (flat_data, n_drivers)
 
 def get_cached_drivers(n_cible, val_max_coche, smooth_bound, extra_primes, max_depth, use_compression=False):
-    primes_sig = sum(extra_primes) if extra_primes else 0
-    cache_base = f"drivers_v5_B{smooth_bound}_D{max_depth}_P{primes_sig}"
+    primes_key = hashlib.md5(str(sorted(extra_primes or [])).encode()).hexdigest()[:12]
+    cache_base = f"drivers_v5_B{smooth_bound}_D{max_depth}_P{primes_key}"
     cache_name = f"{cache_base}.cache.gz" if use_compression else f"{cache_base}.cache"
     flat_data = None
     n_drivers = 0
@@ -1347,15 +1372,17 @@ def worker_search_partial(args):
                 if p_max_needed > 200:
                     _D_factors = set()
                     _tmp_D = D_int
-                    for _sp in (3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,
-                                59,61,67,71,73,79,83,89,97,101,103,107,109,113):
+                    # Use _SMALL_PRIMES_EXTENDED (up to 541) instead of stopping at 113
+                    for _sp in _SMALL_PRIMES_EXTENDED:
+                        if _sp == 2:
+                            continue  # D is always even, skip 2
                         if _tmp_D % _sp == 0:
                             _D_factors.add(_sp)
                             while _tmp_D % _sp == 0:
                                 _tmp_D //= _sp
                         if _tmp_D == 1:
                             break
-                    # Si _tmp_D > 1, un grand facteur premier reste
+                    # If _tmp_D > 1, a large prime factor remains
                     if _tmp_D > 1:
                         _D_factors.add(_tmp_D)
                     
@@ -1935,10 +1962,10 @@ class ArbreAliquoteV5:
                 safety += 1
             path.append(root)
             path.reverse()
-            val_index = path.index(val)
-            successors = path[val_index + 1:]
-            has_smaller_successor = any(s < val for s in successors)
-            if not has_smaller_successor:
+            # Check ancestors (all nodes between root and val, exclusive of both)
+            ancestors_on_path = path[1:-1]  # Exclude root (path[0]) and val (path[-1])
+            has_smaller_ancestor = any(a < val for a in ancestors_on_path)
+            if not has_smaller_ancestor:
                 minima_descendants.append((val, path))
         if not minima_descendants:
             print(f"Aucun minimum descendant trouvé")
