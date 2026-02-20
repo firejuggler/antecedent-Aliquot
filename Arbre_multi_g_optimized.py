@@ -741,6 +741,7 @@ class PerformanceStats:
             print(f"  • Quadratic (factorisé)     : {fs['factorized_quadratic']:>10,}")
             print(f"  • Quadratic (fallback)      : {fs['fallback_quadratic']:>10,}")
             print(f"  • TOTAL Quadratic           : {total_quadratic:>10,}")
+            print(f"  • Solutions P2 (D×p²)       : {fs['found_p2']:>10,}")
         
         print(f"{'='*70}\n")
         self._report_printed = True
@@ -774,6 +775,7 @@ _filter_stats = {
     'entered_quadratic': 0,     # Entrés dans Quadratic (scan linéaire ≤300 iters)
     'factorized_quadratic': 0,  # Entrés dans Quadratic (approche factorisée)
     'fallback_quadratic': 0,    # Fallback scan linéaire (factorisation échouée)
+    'found_p2': 0,              # Solutions trouvées via k = D × p²
 }
 
 # Petits premiers pour calcul de p_min
@@ -1238,7 +1240,7 @@ def worker_search_partial(args):
     lf = {'drivers_tested': 0, 'filtered_bisect': 0, 'filtered_pmin': 0,
           'filtered_qmax': 0, 'filtered_pmax_lt_pmin': 0, 'filtered_tq_prime': 0,
           'entered_semi_direct': 0, 'entered_quadratic': 0,
-          'factorized_quadratic': 0, 'fallback_quadratic': 0}
+          'factorized_quadratic': 0, 'fallback_quadratic': 0, 'found_p2': 0}
     
     # Phase 1 : Pré-tests (seulement pour le premier chunk)
     if do_pretests:
@@ -1315,11 +1317,32 @@ def worker_search_partial(args):
                         k = D_int * q_full
                         if k not in _pretest_keys:
                             solutions[k] = f"D({D_int})"
-                    elif q_full < 1_000_000 and math.gcd(D_int, q_full) == 1:
+                    elif math.gcd(D_int, q_full) == 1:
                         k = D_int * q_full
                         if k not in _pretest_keys:
                             if int(sigma_optimized(k)) - k == node_int:
                                 solutions[k] = f"Multi({D_int})"
+            
+            # ============================================================
+            # Prime-Squared : k = D * p² (puissance de premier copremier à D)
+            # σ(D×p²) = σ(D)×(p²+p+1), donc σ(k)-k = SD×(p²+p+1) - D×p² = node
+            # → p²×sD + p×SD + (SD - node) = 0
+            # Discriminant Δ = SD² - 4×sD×(SD - node)
+            # ============================================================
+            if sD > 0:
+                discriminant = SD_int * SD_int - 4 * sD * (SD_int - node_int)
+                if discriminant >= 0:
+                    sqrt_disc = int(gmpy2.isqrt(discriminant))
+                    if sqrt_disc * sqrt_disc == discriminant:  # Carré parfait
+                        # p = (-SD + sqrt_disc) / (2*sD) — seule racine positive possible
+                        num_p = -SD_int + sqrt_disc
+                        if num_p > 0 and num_p % (2 * sD) == 0:
+                            p_v = num_p // (2 * sD)
+                            if p_v > 1 and D_int % p_v != 0 and gmpy2.is_prime(p_v):
+                                k_pp = D_int * p_v * p_v
+                                if k_pp not in _pretest_keys and k_pp not in solutions:
+                                    solutions[k_pp] = f"P2({D_int})"
+                                    lf['found_p2'] += 1
             
             # ============================================================
             # FILTRE 2 : p_min — plus petit premier copremier à D
