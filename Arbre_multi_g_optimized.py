@@ -1314,7 +1314,8 @@ def worker_search_partial(args):
                     if gmpy2.is_prime(q_full):
                         k = D_int * q_full
                         if k not in _pretest_keys:
-                            solutions[k] = f"D({D_int})"
+                            if int(sigma_optimized(k)) - k == node_int:
+                                solutions[k] = f"D({D_int})"
                     elif q_full < 1_000_000 and math.gcd(D_int, q_full) == 1:
                         k = D_int * q_full
                         if k not in _pretest_keys:
@@ -1403,7 +1404,8 @@ def worker_search_partial(args):
                             continue
                         k_semi = D_int * p * q_v
                         if k_semi not in _pretest_keys:
-                            solutions[k_semi] = f"S({D_int})"
+                            if int(sigma_optimized(k_semi)) - k_semi == node_int:
+                                solutions[k_semi] = f"S({D_int})"
                 else:
                     for p in _SEMI_DIRECT_PRIMES:
                         if p > p_max_needed:
@@ -1422,7 +1424,8 @@ def worker_search_partial(args):
                             continue
                         k_semi = D_int * p * q_v
                         if k_semi not in _pretest_keys:
-                            solutions[k_semi] = f"S({D_int})"
+                            if int(sigma_optimized(k_semi)) - k_semi == node_int:
+                                solutions[k_semi] = f"S({D_int})"
             
             # ========================================================
             # Quadratic : recherche de paires (p,q) via diviseurs
@@ -1493,7 +1496,8 @@ def worker_search_partial(args):
                         if gmpy2.is_prime(q_v):
                             k_quad = D_int * p_v * q_v
                             if k_quad not in _pretest_keys:
-                                solutions[k_quad] = f"Q({D_int})"
+                                if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                    solutions[k_quad] = f"Q({D_int})"
                 else:
                     # Factorisation échouée → fallback scan linéaire
                     lf['fallback_quadratic'] += 1
@@ -1515,7 +1519,8 @@ def worker_search_partial(args):
                                             if gmpy2.is_prime(q_v):
                                                 k_quad = D_int * p_v * q_v
                                                 if k_quad not in _pretest_keys:
-                                                    solutions[k_quad] = f"Q({D_int})"
+                                                    if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                                        solutions[k_quad] = f"Q({D_int})"
                         d += sD
             else:
                 # --- SCAN LINÉAIRE DIRECT (≤ 300 itérations) ---
@@ -1540,7 +1545,8 @@ def worker_search_partial(args):
                                         if gmpy2.is_prime(q_v):
                                             k_quad = D_int * p_v * q_v
                                             if k_quad not in _pretest_keys:
-                                                solutions[k_quad] = f"Q({D_int})"
+                                                if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                                    solutions[k_quad] = f"Q({D_int})"
                     d += sD
     
     return (node_int, solutions, lf)
