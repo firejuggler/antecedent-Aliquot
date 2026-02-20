@@ -706,15 +706,22 @@ class PerformanceStats:
         # Statistiques Filtrage Drivers
         fs = _filter_stats
         if fs['drivers_tested'] > 0:
-            total_filtered = fs['filtered_bisect'] + fs['filtered_pmin']
+            total_filtered = fs['filtered_bisect'] + fs['filtered_pmin'] + fs['filtered_qmax'] + fs['filtered_pmax_lt_pmin'] + fs['filtered_tq_prime']
             pct_filtered = (total_filtered / fs['drivers_tested'] * 100) if fs['drivers_tested'] > 0 else 0
+            total_quadratic = fs['entered_quadratic'] + fs['factorized_quadratic'] + fs['fallback_quadratic']
             print(f"\nFiltrage pré-drivers :")
             print(f"  • Drivers examinés          : {fs['drivers_tested']:>10,}")
             print(f"  • Éliminés (bisect D>node)  : {fs['filtered_bisect']:>10,}")
             print(f"  • Éliminés (p_min)          : {fs['filtered_pmin']:>10,}")
+            print(f"  • Éliminés (q_max ≤ p_min)  : {fs['filtered_qmax']:>10,}")
+            print(f"  • Éliminés (isqrt arrondi)  : {fs['filtered_pmax_lt_pmin']:>10,}")
+            print(f"  • Éliminés (target_q premier): {fs['filtered_tq_prime']:>10,}")
             print(f"  • TOTAL FILTRÉS             : {total_filtered:>10,} ({pct_filtered:.1f}%)")
             print(f"  • Entrés Semi-direct        : {fs['entered_semi_direct']:>10,}")
-            print(f"  • Entrés Quadratic          : {fs['entered_quadratic']:>10,}")
+            print(f"  • Quadratic (scan ≤300)     : {fs['entered_quadratic']:>10,}")
+            print(f"  • Quadratic (factorisé)     : {fs['factorized_quadratic']:>10,}")
+            print(f"  • Quadratic (fallback)      : {fs['fallback_quadratic']:>10,}")
+            print(f"  • TOTAL Quadratic           : {total_quadratic:>10,}")
         
         print(f"{'='*70}\n")
         self._report_printed = True
@@ -741,8 +748,13 @@ _filter_stats = {
     'drivers_tested': 0,        # Total drivers examinés
     'filtered_bisect': 0,       # Éliminés par recherche binaire (D > node)
     'filtered_pmin': 0,         # Éliminés par p_min (SD*(1+p_min) > node)
+    'filtered_qmax': 0,         # Éliminés par q(p_min) ≤ p_min (sans isqrt)
+    'filtered_pmax_lt_pmin': 0, # Éliminés car p_max < p_min (arrondi isqrt)
+    'filtered_tq_prime': 0,     # Éliminés car target_q est premier
     'entered_semi_direct': 0,   # Entrés dans la boucle Semi-direct
-    'entered_quadratic': 0,     # Entrés dans la boucle Quadratic
+    'entered_quadratic': 0,     # Entrés dans Quadratic (scan linéaire ≤300 iters)
+    'factorized_quadratic': 0,  # Entrés dans Quadratic (approche factorisée)
+    'fallback_quadratic': 0,    # Fallback scan linéaire (factorisation échouée)
 }
 
 # Petits premiers pour calcul de p_min
@@ -1054,16 +1066,8 @@ def get_divisors_fast(n):
 # GÉNÉRATION DES DRIVERS
 # ============================================================================
 
-def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, extra_primes=None, max_depth=6):
-    print(f"[Drivers] Génération DFS (B={smooth_bound}, depth={max_depth})...")
-    start = time.time()
-    n_cible_int = int(n_cible)
-    ref_value = max(n_cible_int, val_max_coche) if val_max_coche else n_cible_int
-    harpon_limit = n_cible_int - 1
-    expansion_limit = ref_value
-    _SIGMA_POW2_LIST = [pow(2, m + 1) - 1 for m in range(33)]
-    all_primes = sorted(set(list(primerange(3, smooth_bound + 1)) + (extra_primes or [])))
-    print(f"[Drivers] {len(all_primes)} premiers (3 → {all_primes[-1]})")
+def _generate_odd_drivers(all_primes, harpon_limit, max_depth):
+    """Génère les drivers impairs (partie odd) comme dict {prod: sigma_prod}."""
     drivers_odd = {1: 1}
     def smooth_dfs(idx, prod, sigma_prod, depth):
         if depth >= max_depth:
@@ -1080,11 +1084,15 @@ def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, ex
                 pp *= p
                 sp += pp
     smooth_dfs(0, 1, 1, 0)
-    print(f"[Drivers] {len(drivers_odd) - 1} drivers impairs générés")
+    return drivers_odd
+
+def _expand_to_even_flat(odd_dict, expansion_limit):
+    """Convertit les drivers impairs en drivers pairs (D, SD, sD) triés."""
+    _SIGMA_POW2_LIST = [pow(2, m + 1) - 1 for m in range(33)]
     temp_list = []
     seen_D = set()
-    for d in sorted(drivers_odd.keys()):
-        sigma_d = drivers_odd[d]
+    for d in sorted(odd_dict.keys()):
+        sigma_d = odd_dict[d]
         D = d << 1
         for m in range(1, len(_SIGMA_POW2_LIST)):
             if D > expansion_limit:
@@ -1094,13 +1102,25 @@ def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, ex
                 SD = _SIGMA_POW2_LIST[m] * sigma_d
                 temp_list.append((D, SD, SD - D))
             D <<= 1
-    del drivers_odd, seen_D
     temp_list.sort()
-    n_drivers = len(temp_list)
     flat_data = []
     for D, SD, sD in temp_list:
         flat_data.extend((D, SD, sD))
-    del temp_list
+    return flat_data, len(temp_list)
+
+def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, extra_primes=None, max_depth=6):
+    print(f"[Drivers] Génération DFS (B={smooth_bound}, depth={max_depth})...")
+    start = time.time()
+    n_cible_int = int(n_cible)
+    ref_value = max(n_cible_int, val_max_coche) if val_max_coche else n_cible_int
+    harpon_limit = n_cible_int - 1
+    expansion_limit = ref_value
+    all_primes = sorted(set(list(primerange(3, smooth_bound + 1)) + (extra_primes or [])))
+    print(f"[Drivers] {len(all_primes)} premiers (3 → {all_primes[-1]})")
+    drivers_odd = _generate_odd_drivers(all_primes, harpon_limit, max_depth)
+    print(f"[Drivers] {len(drivers_odd) - 1} drivers impairs générés")
+    flat_data, n_drivers = _expand_to_even_flat(drivers_odd, expansion_limit)
+    del drivers_odd
     elapsed = time.time() - start
     _stats.driver_generation_time = elapsed
     ram_mb = n_drivers * 24 / 1024 / 1024
@@ -1181,13 +1201,19 @@ def worker_search_partial(args):
     """
     Recherche partielle : traite uniquement les drivers [drv_start, drv_end).
     Si do_pretests=True, exécute aussi les heuristiques rapides (Diff, Prim, Pomerance).
-    Retourne (node_int, solutions_partielles).
+    Retourne (node_int, solutions_partielles, local_filter_stats).
     """
     global _worker_drivers, _worker_n_drivers
     node, drv_start, drv_end, do_pretests = args
     node_int = int(node)
     solutions = {}
     drv = _worker_drivers
+    
+    # Compteurs locaux (renvoyés au processus principal)
+    lf = {'drivers_tested': 0, 'filtered_bisect': 0, 'filtered_pmin': 0,
+          'filtered_qmax': 0, 'filtered_pmax_lt_pmin': 0, 'filtered_tq_prime': 0,
+          'entered_semi_direct': 0, 'entered_quadratic': 0,
+          'factorized_quadratic': 0, 'fallback_quadratic': 0}
     
     # Phase 1 : Pré-tests (seulement pour le premier chunk)
     if do_pretests:
@@ -1241,9 +1267,9 @@ def worker_search_partial(args):
                 else:
                     hi = mid
             effective_end = lo
-            _filter_stats['filtered_bisect'] += (drv_end - effective_end)
+            lf['filtered_bisect'] += (drv_end - effective_end)
         
-        _filter_stats['drivers_tested'] += (drv_end - drv_start)
+        lf['drivers_tested'] += (drv_end - drv_start)
         
         for idx in range(drv_start, effective_end):
             off = idx * 3
@@ -1274,68 +1300,203 @@ def worker_search_partial(args):
             # FILTRE 2 : p_min — plus petit premier copremier à D
             # Si σ(D)×(1+p_min) > node, aucun premier p ne donne une
             # solution semi-directe ni quadratique → skip complet.
-            # Raison : s(D·p·q) = σ(D)(1+p)(1+q) - D·p·q, et la
-            # condition σ(D)(1+p) ≤ node est nécessaire (car q ≥ 1).
-            # p_min est le plus petit p valide, donc si ça échoue
-            # pour p_min, ça échoue pour tout p > p_min aussi.
             # ============================================================
             p_min = _smallest_coprime_prime(D_int)
             if SD_int * (1 + p_min) > node_int:
-                _filter_stats['filtered_pmin'] += 1
+                lf['filtered_pmin'] += 1
                 continue
             
-            # Semi-direct: k = D * p * q
+            # ============================================================
+            # FILTRE 3 (PRE-ISQRT) : q(p_min) ≤ p_min → skip
+            # q est décroissant en p. Si q(p_min) ≤ p_min, aucun
+            # couple (p,q) avec q > p n'existe.
+            # Équivalent à p_min ≥ p_max_needed mais SANS isqrt.
+            # Coût : 2 multiplications + 1 comparaison.
+            # ============================================================
             target_q = sD * node_int + SD_int * D_int
             if target_q <= 0:
                 continue
             
-            sqrt_target = gmpy2.isqrt(target_q)
-            p_max_needed = (int(sqrt_target) - SD_int) // sD
+            # q(p_min) = num_qmin / den_qmin ; skip si ≤ p_min
+            num_qmin = node_int - SD_int * (1 + p_min)  # > 0 (filtre 2 passé)
+            den_qmin = SD_int + p_min * sD
+            if num_qmin <= p_min * den_qmin:
+                lf['filtered_qmax'] += 1
+                continue
+            
+            # ============================================================
+            # ISQRT + p_max (nécessaire pour borner les boucles)
+            # ============================================================
+            sqrt_target_int = int(gmpy2.isqrt(target_q))
+            p_max_needed = (sqrt_target_int - SD_int) // sD
+            
+            # Sécurité: si arrondi d'isqrt donne p_max < p_min (rare)
+            if p_max_needed < p_min:
+                lf['filtered_pmax_lt_pmin'] += 1
+                continue
             
             # ========================================================
-            # Semi-direct : k = D * p * q (sieve rapide)
+            # Semi-direct : k = D * p * q (sieve rapide, p ≤ 10^6)
             # ========================================================
             if p_max_needed <= _SEMI_DIRECT_P_MAX:
-                _filter_stats['entered_semi_direct'] += 1
-                for p in _SEMI_DIRECT_PRIMES:
-                    if p > p_max_needed:
-                        break
-                    if D_int % p == 0:
-                        continue
-                    SD_1p = SD_int * (1 + p)
-                    if SD_1p > node_int:
-                        break
-                    den = SD_1p - D_int * p
-                    if den <= 0:
-                        continue
-                    num_q = node_int - SD_1p
-                    if num_q <= 0:
-                        break
-                    if num_q % den != 0:
-                        continue
-                    q_v = num_q // den
-                    if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
-                        continue
-                    k_semi = D_int * p * q_v
-                    if k_semi not in _pretest_keys:
-                        solutions[k_semi] = f"S({D_int})"
+                lf['entered_semi_direct'] += 1
+                
+                # Pour grands p_max, pré-calculer les facteurs de D
+                # pour remplacer D_int % p (division bigint) par
+                # un test d'appartenance O(1) dans un set.
+                if p_max_needed > 200:
+                    _D_factors = set()
+                    _tmp_D = D_int
+                    for _sp in (3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,
+                                59,61,67,71,73,79,83,89,97,101,103,107,109,113):
+                        if _tmp_D % _sp == 0:
+                            _D_factors.add(_sp)
+                            while _tmp_D % _sp == 0:
+                                _tmp_D //= _sp
+                        if _tmp_D == 1:
+                            break
+                    # Si _tmp_D > 1, un grand facteur premier reste
+                    if _tmp_D > 1:
+                        _D_factors.add(_tmp_D)
+                    
+                    for p in _SEMI_DIRECT_PRIMES:
+                        if p > p_max_needed:
+                            break
+                        if p in _D_factors:
+                            continue
+                        SD_1p = SD_int * (1 + p)
+                        if SD_1p > node_int:
+                            break
+                        num_q = node_int - SD_1p
+                        den = SD_int + p * sD
+                        if num_q % den != 0:
+                            continue
+                        q_v = num_q // den
+                        if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
+                            continue
+                        k_semi = D_int * p * q_v
+                        if k_semi not in _pretest_keys:
+                            solutions[k_semi] = f"S({D_int})"
+                else:
+                    for p in _SEMI_DIRECT_PRIMES:
+                        if p > p_max_needed:
+                            break
+                        if D_int % p == 0:
+                            continue
+                        SD_1p = SD_int * (1 + p)
+                        if SD_1p > node_int:
+                            break
+                        num_q = node_int - SD_1p
+                        den = SD_int + p * sD
+                        if num_q % den != 0:
+                            continue
+                        q_v = num_q // den
+                        if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
+                            continue
+                        k_semi = D_int * p * q_v
+                        if k_semi not in _pretest_keys:
+                            solutions[k_semi] = f"S({D_int})"
             
             # ========================================================
-            # Quadratic : recherche par diviseurs avec saut modulaire
+            # Quadratic : recherche de paires (p,q) via diviseurs
+            # de target_q = (SD + sD·p)(SD + sD·q)
             # ========================================================
-            if target_q <= MAX_TARGET_QUADRATIC:
-                sqrt_target_tmp = gmpy2.isqrt(target_q)
-                if sqrt_target_tmp // sD > QUADRATIC_MAX_ITERATIONS:
+            if target_q > MAX_TARGET_QUADRATIC:
+                continue
+            
+            # Borne inférieure : p_start évite de retester les p
+            # déjà couverts par Semi-direct
+            if p_max_needed <= _SEMI_DIRECT_P_MAX:
+                p_start = _SEMI_DIRECT_P_MAX + 1
+            else:
+                p_start = p_min
+            div_min = p_start * sD + SD_int
+            
+            # Rien à chercher si div_min > √target_q
+            if div_min > sqrt_target_int:
+                continue
+            
+            n_quad_iters = (sqrt_target_int - div_min) // sD + 1
+            
+            if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
+                continue
+            
+            # ============================================================
+            # STRATÉGIE ADAPTATIVE :
+            # - Peu d'itérations (≤ 300) → scan linéaire direct.
+            #   Le scan est MOINS cher que is_prime(target_q) (~5µs)
+            #   car 300 × modulo < Miller-Rabin. On ne teste donc
+            #   PAS la primalité ici — si target_q est premier, le
+            #   scan ne trouvera rien en ~15µs (acceptable).
+            #
+            # - Beaucoup d'itérations (> 300) → tester is_prime d'abord
+            #   (évite une factorisation coûteuse pour ~5% des cas),
+            #   puis factoriser target_q et énumérer ses diviseurs.
+            # ============================================================
+            if n_quad_iters > 300:
+                # Test primalité UNIQUEMENT pour le path factorisé
+                if gmpy2.is_prime(target_q):
+                    lf['filtered_tq_prime'] += 1
                     continue
-                if node_int % 2 == 1 and gmpy2.is_prime(target_q):
-                    continue
-                if p_max_needed <= _SEMI_DIRECT_P_MAX:
-                    div_min = (_SEMI_DIRECT_P_MAX + 1) * sD + SD_int
+                
+                # --- APPROCHE FACTORISÉE ---
+                divisors = get_divisors_fast(int(target_q))
+                if divisors:
+                    lf['factorized_quadratic'] += 1
+                    for d_val in divisors:
+                        if d_val > sqrt_target_int:
+                            break
+                        if d_val < div_min:
+                            continue
+                        diff = d_val - SD_int
+                        if diff <= 0 or diff % sD != 0:
+                            continue
+                        p_v = diff // sD
+                        if p_v <= 1 or D_int % p_v == 0:
+                            continue
+                        if not gmpy2.is_prime(p_v):
+                            continue
+                        div_q = target_q // d_val
+                        diff_q = div_q - SD_int
+                        if diff_q <= 0 or diff_q % sD != 0:
+                            continue
+                        q_v = diff_q // sD
+                        if q_v <= p_v or D_int % q_v == 0:
+                            continue
+                        if gmpy2.is_prime(q_v):
+                            k_quad = D_int * p_v * q_v
+                            if k_quad not in _pretest_keys:
+                                solutions[k_quad] = f"Q({D_int})"
                 else:
-                    div_min = 2 * sD + SD_int
+                    # Factorisation échouée → fallback scan linéaire
+                    lf['fallback_quadratic'] += 1
+                    d = div_min
+                    while d <= sqrt_target_int:
+                        if target_q % d == 0:
+                            diff = d - SD_int
+                            if diff > 0 and diff % sD == 0:
+                                p_v = diff // sD
+                                if p_v > 1 and D_int % p_v == 0:
+                                    d += sD
+                                    continue
+                                if gmpy2.is_prime(p_v):
+                                    div_q = target_q // d
+                                    diff_q = div_q - SD_int
+                                    if diff_q > 0 and diff_q % sD == 0:
+                                        q_v = diff_q // sD
+                                        if q_v > p_v and D_int % q_v != 0:
+                                            if gmpy2.is_prime(q_v):
+                                                k_quad = D_int * p_v * q_v
+                                                if k_quad not in _pretest_keys:
+                                                    solutions[k_quad] = f"Q({D_int})"
+                        d += sD
+            else:
+                # --- SCAN LINÉAIRE DIRECT (≤ 300 itérations) ---
+                # Pas de test de primalité : le scan coûte ≤ 15µs,
+                # moins cher que is_prime (~5µs) dans 95% des cas.
+                lf['entered_quadratic'] += 1
                 d = div_min
-                _filter_stats['entered_quadratic'] += 1
-                while d <= sqrt_target:
+                while d <= sqrt_target_int:
                     if target_q % d == 0:
                         diff = d - SD_int
                         if diff > 0 and diff % sD == 0:
@@ -1355,7 +1516,7 @@ def worker_search_partial(args):
                                                 solutions[k_quad] = f"Q({D_int})"
                     d += sD
     
-    return (node_int, solutions)
+    return (node_int, solutions, lf)
 
 
 def worker_search(node):
@@ -1565,13 +1726,15 @@ class ArbreAliquoteV5:
                     
                     # Collecter les résultats partiels par nœud
                     partial_results = {}  # {node_int: {k: type, ...}}
-                    for node_int, partial_solutions in pool.imap_unordered(
+                    for node_int, partial_solutions, local_fs in pool.imap_unordered(
                             worker_search_partial, partial_tasks, chunksize=1):
                         if self.stop:
                             break
                         if node_int not in partial_results:
                             partial_results[node_int] = {}
                         partial_results[node_int].update(partial_solutions)
+                        for key in local_fs:
+                            _filter_stats[key] += local_fs[key]
                     
                     # Fusionner et sauvegarder
                     for node_val in to_compute:
@@ -1591,9 +1754,11 @@ class ArbreAliquoteV5:
                 
                 else:
                     # ✅ MODE STANDARD : 1 nœud = 1 worker (comme avant)
-                    for node_val, solutions in pool.imap_unordered(worker_search, to_compute, chunksize=1):
+                    for node_val, solutions, local_fs in pool.imap_unordered(worker_search, to_compute, chunksize=1):
                         if self.stop:
                             break
+                        for key in local_fs:
+                            _filter_stats[key] += local_fs[key]
                         self._save_node(node_val, solutions)
                         self.explored.add(node_val)
                         _stats.total_nodes_processed += 1
