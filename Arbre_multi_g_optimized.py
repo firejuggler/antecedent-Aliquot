@@ -52,6 +52,32 @@ from sympy import primerange
 from collections import defaultdict, OrderedDict, deque
 
 # ============================================================================
+# P2 : ECM IMPORT (sympy Elliptic Curve Method)
+# ============================================================================
+try:
+    from sympy.ntheory import ecm as _sympy_ecm
+    ECM_AVAILABLE = True
+except ImportError:
+    ECM_AVAILABLE = False
+    print("[ECM] X sympy.ntheory.ecm non disponible")
+
+# ============================================================================
+# P4 : CYTHON IMPORT (boucles compilees en C)
+# ============================================================================
+try:
+    import fast_loops as _cython_loops
+    CYTHON_AVAILABLE = True
+    print("[Cython] OK Module fast_loops charge (boucles C compilees)")
+except ImportError:
+    CYTHON_AVAILABLE = False
+    # print("[Cython] X Module fast_loops non disponible (mode Python pur)")
+
+# ============================================================================
+# P2 : Seuils ECM
+# ============================================================================
+ECM_FALLBACK_THRESHOLD = 10**15
+
+# ============================================================================
 # NUMBA OPTIMIZATION
 # ============================================================================
 try:
@@ -80,7 +106,6 @@ SIGMA_CACHE_SIZE = 10000
 DIVISORS_CACHE_SIZE = 5000
 MAX_DIVISORS = 8000
 MAX_TARGET_QUADRATIC = 10**18
-MAX_POLLARD_ITERATIONS = 30000
 QUADRATIC_MAX_ITERATIONS = 1_000_000  # Budget max d'itérations par driver pour Quadratic
 GAMMA = 0.57721566490153286
 EXP_GAMMA = math.exp(GAMMA)
@@ -238,7 +263,6 @@ def pollard_rho_numba(n, max_iterations=100000):
             
             k = 0
             while k < r and g == 1:
-                ys = y
                 batch_size = min(128, r - k)
                 for _ in range(batch_size):
                     y = (y * y + c_val) % n
@@ -361,7 +385,6 @@ class ImprovedPomeranceH2:
         }
         
         self.max_candidates_per_node = 200
-        self.enable_pomerance = True
     
     def get_multipliers(self, n):
         if n < 1_000_000:
@@ -411,8 +434,6 @@ class ImprovedPomeranceH2:
         return result
     
     def generate_candidates_h2(self, node_int):
-        if not self.enable_pomerance:
-            return {}
         candidates = {}
         multipliers = self.get_multipliers(node_int)
         
@@ -465,20 +486,6 @@ class ImprovedPomeranceH2:
         
         self.stats['total_generated'] += len(candidates)
         return candidates
-    
-    def print_stats(self):
-        print("\n" + "="*70)
-        print("STATISTIQUES POMERANCE H2")
-        print("="*70)
-        print(f"  Total candidats générés : {self.stats['total_generated']:,}")
-        print(f"  - Standard (PomStd)     : {self.stats['std']:,}")
-        print(f"  - Étendu (PomExt)       : {self.stats['ext']:,}")
-        print(f"  - Puissance 2 (PomPow2) : {self.stats['pow2']:,}")
-        print(f"  Filtrés par Robin       : {self.stats['filtered']:,}")
-        print(f"  Cache hits              : {self.stats['cache_hits']:,}")
-        print(f"  Taille cache Robin      : {len(self.robin_cache)}")
-        print(f"  Taille cache loglog     : {len(self.loglog_cache)}")
-        print("="*70)
 
 _improved_pomerance = ImprovedPomeranceH2()
 
@@ -660,7 +667,6 @@ class PerformanceStats:
         self.cache_misses = 0
         self.generation_times = []
         self.solutions_per_type = defaultdict(int)
-        self.pomerance_stats = defaultdict(int)
         self.start_time = time.time()
     
     def add_solution(self, solution_type):
@@ -703,24 +709,28 @@ class PerformanceStats:
                 efficiency = (1 - pom_stats['filtered'] / (total_gen + pom_stats['filtered'])) * 100
                 print(f"  • Efficacité pré-filtrage      : {efficiency:.1f}%")
         
-        # Statistiques Numba
-        if NUMBA_AVAILABLE:
-            total_sigma = _numba_stats['sigma_numba'] + _numba_stats['sigma_gmpy2']
-            total_factor = _numba_stats['factorize_numba'] + _numba_stats['factorize_gmpy2']
-            
-            if total_sigma > 0 or total_factor > 0:
-                print(f"\nOptimisations Numba (seuil: {NUMBA_THRESHOLD:,}) :")
-                if total_sigma > 0:
-                    pct_numba = (_numba_stats['sigma_numba'] / total_sigma * 100)
-                    print(f"  • σ(n) - Numba      : {_numba_stats['sigma_numba']:>6} ({pct_numba:5.1f}%)")
-                    print(f"  • σ(n) - gmpy2      : {_numba_stats['sigma_gmpy2']:>6} ({100-pct_numba:5.1f}%)")
-                if total_factor > 0:
-                    pct_numba_f = (_numba_stats['factorize_numba'] / total_factor * 100)
-                    print(f"  • factorize - Numba : {_numba_stats['factorize_numba']:>6} ({pct_numba_f:5.1f}%)")
-                    print(f"  • factorize - gmpy2 : {_numba_stats['factorize_gmpy2']:>6} ({100-pct_numba_f:5.1f}%)")
-                if total_sigma > 0:
-                    speedup_estimate = 1 + (pct_numba / 100) * 7  # Estimation conservative 7x speedup
-                    print(f"  • Accélération estimée : ~{speedup_estimate:.1f}x")
+        # Statistiques V6 (P1/P2/P3/P4)
+        ns = _numba_stats
+        total_sigma = ns['sigma_numba'] + ns['sigma_gmpy2'] + ns.get('sigma_from_factors', 0)
+        total_factor = ns['factorize_numba'] + ns['factorize_gmpy2']
+        
+        if total_sigma > 0 or total_factor > 0:
+            print(f"\n--- Optimisations V6 TURBO ---")
+            if total_sigma > 0:
+                pct_fused = (ns.get('sigma_from_factors', 0) / total_sigma * 100) if total_sigma > 0 else 0
+                print(f"  P1 sigma via facteurs  : {ns.get('sigma_from_factors', 0):>6} ({pct_fused:5.1f}%)")
+                print(f"     sigma Numba direct  : {ns['sigma_numba']:>6}")
+                print(f"     sigma gmpy2 direct  : {ns['sigma_gmpy2']:>6}")
+            if total_factor > 0:
+                print(f"  P2 factorize Numba    : {ns['factorize_numba']:>6}")
+                print(f"     factorize gmpy2    : {ns['factorize_gmpy2']:>6}")
+                print(f"     factorize ECM used : {ns.get('factorize_ecm', 0):>6}")
+                print(f"     ECM appels/succes  : {ns.get('ecm_calls', 0)}/{ns.get('ecm_success', 0)}")
+            print(f"  P3 Crible semi-direct : {_SEMI_DIRECT_P_MAX:,} ({len(_SEMI_DIRECT_PRIMES):,} premiers)")
+            if CYTHON_AVAILABLE:
+                print(f"  P4 Cython+            : ACTIF (semi_direct, divisors, quadratic_scan, sieve, drivers)")
+            else:
+                print(f"  P4 Cython             : INACTIF (Python pur)")
         
         # Statistiques Filtrage Drivers
         fs = _filter_stats
@@ -753,10 +763,54 @@ _stats = PerformanceStats()
 
 _sigma_cache = OrderedDict()
 _divisors_cache = OrderedDict()
-_SMALL_PRIMES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79, 83, 89, 97)
+_factors_cache = OrderedDict()  # P1: cache de factorisation
+_FACTORS_CACHE_SIZE = 10000
+# _SMALL_PRIMES supprimé : redondant avec _SMALL_PRIMES_EXTENDED[1:25]
+_SMALL_PRIMES = _SMALL_PRIMES_EXTENDED[1:25]  # (3, 5, ..., 97) — vue sur le tuple existant
 
-# Statistiques d'utilisation Numba
-_numba_stats = {'sigma_numba': 0, 'sigma_gmpy2': 0, 'factorize_numba': 0, 'factorize_gmpy2': 0}
+# Statistiques d'utilisation Numba + P1/P2
+_numba_stats = {
+    'sigma_numba': 0, 'sigma_gmpy2': 0, 'sigma_from_factors': 0,
+    'factorize_numba': 0, 'factorize_gmpy2': 0, 'factorize_ecm': 0,
+    'ecm_calls': 0, 'ecm_success': 0,
+}
+
+
+# ============================================================================
+# P1 : sigma depuis factorisation — O(nb facteurs) au lieu de O(sqrt(n))
+# ============================================================================
+
+def sigma_from_factors(factors_dict):
+    total = mpz(1)
+    for p, e in factors_dict.items():
+        total *= (mpz(p) ** (e + 1) - 1) // (p - 1)
+    return total
+
+
+# ============================================================================
+# P2 : ECM fallback pour factorisation
+# ============================================================================
+
+def _ecm_factor(n):
+    if not ECM_AVAILABLE:
+        return None
+    try:
+        n_int = int(n)
+        if n_int < 7:
+            return None
+        factors_set = _sympy_ecm(n_int)
+        _numba_stats['ecm_calls'] += 1
+        if factors_set and len(factors_set) > 1:
+            _numba_stats['ecm_success'] += 1
+            return min(factors_set)
+        if factors_set and len(factors_set) == 1:
+            f = next(iter(factors_set))
+            if f != n_int:
+                _numba_stats['ecm_success'] += 1
+                return f
+        return None
+    except Exception:
+        return None
 
 # ============================================================================
 # FILTRES PRÉ-DRIVERS
@@ -764,20 +818,20 @@ _numba_stats = {'sigma_numba': 0, 'sigma_gmpy2': 0, 'factorize_numba': 0, 'facto
 
 # Statistiques de filtrage (accumulées par worker, non thread-safe mais informatif)
 _filter_stats = {
-    'drivers_tested': 0,        # Total drivers examinés
-    'filtered_bisect': 0,       # Éliminés par recherche binaire (D > node)
-    'filtered_pmin': 0,         # Éliminés par p_min (SD*(1+p_min) > node)
-    'filtered_qmax': 0,         # Éliminés par q(p_min) ≤ p_min (sans isqrt)
-    'filtered_pmax_lt_pmin': 0, # Éliminés car p_max < p_min (arrondi isqrt)
-    'filtered_tq_prime': 0,     # Éliminés car target_q est premier
-    'entered_semi_direct': 0,   # Entrés dans la boucle Semi-direct
-    'entered_quadratic': 0,     # Entrés dans Quadratic (scan linéaire ≤300 iters)
-    'factorized_quadratic': 0,  # Entrés dans Quadratic (approche factorisée)
-    'fallback_quadratic': 0,    # Fallback scan linéaire (factorisation échouée)
+    'drivers_tested': 0,        # Total drivers examines
+    'filtered_bisect': 0,       # Elimines par recherche binaire (D > node)
+    'filtered_pmin': 0,         # Elimines par p_min (SD*(1+p_min) > node)
+    'filtered_qmax': 0,         # Elimines par q(p_min) <= p_min (sans isqrt)
+    'filtered_pmax_lt_pmin': 0, # Elimines car p_max < p_min (arrondi isqrt)
+    'filtered_tq_prime': 0,     # Elimines car target_q est premier
+    'entered_semi_direct': 0,   # Entres dans la boucle Semi-direct
+    'entered_quadratic': 0,     # Entres dans Quadratic (scan lineaire <=300 iters)
+    'factorized_quadratic': 0,  # Entres dans Quadratic (approche factorisee)
+    'fallback_quadratic': 0,    # Fallback scan lineaire (factorisation echouee)
 }
 
-# Petits premiers pour calcul de p_min
-_P_MIN_CANDIDATES = (3, 5, 7, 11, 13, 17, 19, 23, 29, 31, 37, 41, 43, 47, 53)
+# Petits premiers pour calcul de p_min (3..53 = _SMALL_PRIMES_EXTENDED[1:16])
+_P_MIN_CANDIDATES = _SMALL_PRIMES_EXTENDED[1:16]  # (3, 5, 7, ..., 53)
 
 def _smallest_coprime_prime(D):
     """Plus petit premier impair ne divisant pas D (D est toujours pair)."""
@@ -801,8 +855,9 @@ if NUMBA_AVAILABLE:
 
 def sigma_optimized(n):
     """
-    Dispatch intelligent : Numba pour n < 10^15, gmpy2 pour n >= 10^15
-    Gains typiques : 5-15x sur les petits/moyens nombres
+    P1: Dispatch intelligent avec fusion factorize+sigma pour n >= 10^12.
+    Pour n < 10^12 : Numba direct.
+    Pour n >= 10^12 : factorize puis sigma_from_factors (~200x plus rapide).
     """
     if n < 2:
         return mpz(1) if n == 1 else mpz(0)
@@ -814,9 +869,12 @@ def sigma_optimized(n):
         _sigma_cache.move_to_end(n_int)
         return _sigma_cache[n_int]
     
-    # Dispatch : Numba vs gmpy2
-    if NUMBA_AVAILABLE and n_int < NUMBA_THRESHOLD:
-        # Utiliser Numba (5-15x plus rapide pour n < 10^15)
+    # P1: Pour n >= NUMBA_THRESHOLD, utiliser factorize + sigma_from_factors
+    if n_int >= NUMBA_THRESHOLD:
+        _numba_stats['sigma_from_factors'] += 1
+        factors = factorize_fast(n_int)
+        result = sigma_from_factors(factors)
+    elif NUMBA_AVAILABLE:
         result = mpz(sigma_numba(n_int))
         _numba_stats['sigma_numba'] += 1
     else:
@@ -877,14 +935,15 @@ def sigma_optimized(n):
 
 def factorize_fast(n):
     """
-    Dispatch intelligent : Numba pour n < 10^15, gmpy2 pour n >= 10^15
-    
-    VERSION ULTRA-OPTIMISÉE:
-    - Trial division étendu (jusqu'à 541)
-    - Pollard-Rho Brent optimisé (50 tentatives, batch GCD)
-    - Avec Numba : 10-50x plus rapide pour n < 10^15
+    P1+P2: Factorisation unifiee avec cache + ECM fallback.
+    Trial division -> Pollard-Rho -> ECM (pour composites recalcitrants).
     """
     n_int = int(n)
+    
+    # P1: Cache de factorisation
+    if n_int in _factors_cache:
+        _factors_cache.move_to_end(n_int)
+        return _factors_cache[n_int].copy()
     
     # Dispatch : Numba vs gmpy2
     if NUMBA_AVAILABLE and n_int < NUMBA_THRESHOLD:
@@ -907,47 +966,49 @@ def factorize_fast(n):
                     temp_n //= p
                 factors[p] = exp
                 if temp_n == 1:
-                    return factors
+                    break
         
-        if temp_n == 1:
-            return factors
+        if temp_n > 1:
+            if is_prime_numba(temp_n):
+                factors[temp_n] = 1
+            else:
+                # Utiliser Pollard-Rho Numba
+                factor = pollard_rho_numba(temp_n)
+                
+                if factor and factor > 1 and factor != temp_n:
+                    # Décomposer récursivement
+                    sub_factors1 = factorize_fast(factor)
+                    sub_factors2 = factorize_fast(temp_n // factor)
+                    
+                    for p, e in sub_factors1.items():
+                        factors[p] = factors.get(p, 0) + e
+                    for p, e in sub_factors2.items():
+                        factors[p] = factors.get(p, 0) + e
+                else:
+                    # Échec Pollard-Rho : fallback trial division étendue
+                    d = 547
+                    while d * d <= temp_n:
+                        if temp_n % d == 0:
+                            exp = 0
+                            while temp_n % d == 0:
+                                exp += 1
+                                temp_n //= d
+                            factors[d] = factors.get(d, 0) + exp
+                            if temp_n == 1:
+                                break
+                            if is_prime_numba(temp_n):
+                                factors[temp_n] = factors.get(temp_n, 0) + 1
+                                break
+                        d += 2
+                    else:
+                        # Reste (premier ou composite irréductible)
+                        if temp_n > 1:
+                            factors[temp_n] = factors.get(temp_n, 0) + 1
         
-        if is_prime_numba(temp_n):
-            factors[temp_n] = 1
-            return factors
-        
-        # Utiliser Pollard-Rho Numba
-        factor = pollard_rho_numba(temp_n)
-        
-        if factor and factor > 1 and factor != temp_n:
-            # Décomposer récursivement
-            sub_factors1 = factorize_fast(factor)
-            sub_factors2 = factorize_fast(temp_n // factor)
-            
-            for p, e in sub_factors1.items():
-                factors[p] = factors.get(p, 0) + e
-            for p, e in sub_factors2.items():
-                factors[p] = factors.get(p, 0) + e
-        else:
-            # Échec Pollard-Rho : fallback trial division étendue
-            d = 547
-            while d * d <= temp_n:
-                if temp_n % d == 0:
-                    exp = 0
-                    while temp_n % d == 0:
-                        exp += 1
-                        temp_n //= d
-                    factors[d] = factors.get(d, 0) + exp
-                    if temp_n == 1:
-                        return factors
-                    if is_prime_numba(temp_n):
-                        factors[temp_n] = factors.get(temp_n, 0) + 1
-                        return factors
-                d += 2
-            # Reste (premier ou composite irréductible)
-            if temp_n > 1:
-                factors[temp_n] = factors.get(temp_n, 0) + 1
-        
+        # P1: cache result (était manquant dans le path Numba)
+        _factors_cache[n_int] = factors.copy()
+        if len(_factors_cache) > _FACTORS_CACHE_SIZE:
+            _factors_cache.popitem(last=False)
         return factors
     
     else:
@@ -1007,7 +1068,6 @@ def factorize_fast(n):
                     
                     k = 0
                     while k < r and g == 1:
-                        ys = y
                         batch_size = min(128, r - k)
                         for _ in range(batch_size):
                             y = (y * y + c) % m
@@ -1036,8 +1096,15 @@ def factorize_fast(n):
             
             f = pollard_brent_optimized(m)
             
+            # P2: ECM fallback si Pollard echoue sur grand composite
+            if (f is None or f == m) and int(m) > ECM_FALLBACK_THRESHOLD:
+                _numba_stats['factorize_ecm'] += 1
+                ecm_f = _ecm_factor(m)
+                if ecm_f is not None and ecm_f > 1 and ecm_f != int(m):
+                    f = mpz(ecm_f)
+            
             if f is None or f == m:
-                # Fallback : trial division étendu jusqu'à 10^7
+                # Fallback : trial division etendu jusqu'a 10^7
                 limit = min(10_000_000, int(gmpy2.isqrt(m)) + 1)
                 for p in range(547, limit, 2):
                     if m % p == 0:
@@ -1054,6 +1121,10 @@ def factorize_fast(n):
         if temp_n > 1:
             decompose(temp_n)
         
+        # P1: cache result
+        _factors_cache[n_int] = factors.copy()
+        if len(_factors_cache) > _FACTORS_CACHE_SIZE:
+            _factors_cache.popitem(last=False)
         return factors
 
 def get_divisors_fast(n):
@@ -1062,29 +1133,71 @@ def get_divisors_fast(n):
         _divisors_cache.move_to_end(n)
         return _divisors_cache[n]
     f_dict = factorize_fast(n)
-    num_divs = 1
-    for exp in f_dict.values():
-        num_divs *= (exp + 1)
-        if num_divs > MAX_DIVISORS:
-            return []
-    divs = [1]
-    for p, e in f_dict.items():
-        new_divs = []
-        p_power = 1
-        for _ in range(e + 1):
-            for d in divs:
-                new_divs.append(d * p_power)
-            p_power *= p
-        divs = new_divs
-    divs.sort()
+    # P4: Cython pour la construction des diviseurs (2-3x plus rapide)
+    if CYTHON_AVAILABLE:
+        divs = _cython_loops.get_divisors_fast_c(f_dict, MAX_DIVISORS)
+    else:
+        num_divs = 1
+        for exp in f_dict.values():
+            num_divs *= (exp + 1)
+            if num_divs > MAX_DIVISORS:
+                return []
+        divs = [1]
+        for p, e in f_dict.items():
+            new_divs = []
+            p_power = 1
+            for _ in range(e + 1):
+                for d in divs:
+                    new_divs.append(d * p_power)
+                p_power *= p
+            divs = new_divs
+        divs.sort()
     _divisors_cache[n] = divs
     if len(_divisors_cache) > DIVISORS_CACHE_SIZE:
         _divisors_cache.popitem(last=False)
     return divs
 
 # ============================================================================
-# UTILITAIRES DIVISEURS
+# P6 : DIVISEURS DANS UN INTERVALLE (pruning DFS)
 # ============================================================================
+
+def get_divisors_in_range(n, lo, hi):
+    """
+    P6: Genere les diviseurs de n dans [lo, hi] uniquement.
+    Utilise Cython DFS avec pruning si disponible, sinon DFS Python.
+    """
+    n_int = int(n)
+    f_dict = factorize_fast(n_int)
+    num_divs = 1
+    for exp in f_dict.values():
+        num_divs *= (exp + 1)
+        if num_divs > MAX_DIVISORS * 10:
+            return []
+    if CYTHON_AVAILABLE:
+        return _cython_loops.divisors_in_range(f_dict, lo, hi)
+    else:
+        prime_list = sorted(f_dict.items())
+        result = []
+        _py_divisors_dfs(prime_list, 0, 1, lo, hi, result)
+        result.sort()
+        return result
+
+
+def _py_divisors_dfs(prime_list, idx, current, lo, hi, result):
+    """DFS Python avec pruning (fallback si pas de Cython)."""
+    if current > hi:
+        return
+    if idx == len(prime_list):
+        if current >= lo:
+            result.append(current)
+        return
+    p, max_e = prime_list[idx]
+    pe = 1
+    for e in range(max_e + 1):
+        if current * pe > hi:
+            break
+        _py_divisors_dfs(prime_list, idx + 1, current * pe, lo, hi, result)
+        pe *= p
 
 
 # ============================================================================
@@ -1093,6 +1206,10 @@ def get_divisors_fast(n):
 
 def _generate_odd_drivers(all_primes, harpon_limit, max_depth):
     """Génère les drivers impairs (partie odd) comme dict {prod: sigma_prod}."""
+    # P4: Cython DFS si disponible (2-4x plus rapide)
+    if CYTHON_AVAILABLE:
+        drivers_odd = _cython_loops.generate_odd_drivers_c(list(all_primes), harpon_limit, max_depth)
+        return drivers_odd
     drivers_odd = {1: 1}
     def smooth_dfs(idx, prod, sigma_prod, depth):
         if depth >= max_depth:
@@ -1112,28 +1229,48 @@ def _generate_odd_drivers(all_primes, harpon_limit, max_depth):
     return drivers_odd
 
 def _expand_to_even_flat(odd_dict, expansion_limit):
-    """Convertit les drivers impairs en drivers pairs (D, SD, sD) triés."""
-    _SIGMA_POW2_LIST = [pow(2, m + 1) - 1 for m in range(33)]
+    """Convertit les drivers impairs en drivers pairs (D, SD, sD, mask_pmin) triés.
+    V2: 4 champs par driver. mask_pmin pré-calculé via Cython (bitmask coprime + p_min).
+    """
     temp_list = []
     seen_D = set()
     for d in sorted(odd_dict.keys()):
         sigma_d = odd_dict[d]
         D = d << 1
-        for m in range(1, len(_SIGMA_POW2_LIST)):
+        for m in range(1, len(SIGMA_POW2)):
             if D > expansion_limit:
                 break
             if D not in seen_D:
                 seen_D.add(D)
-                SD = _SIGMA_POW2_LIST[m] * sigma_d
+                SD = int(SIGMA_POW2[m]) * sigma_d
                 temp_list.append((D, SD, SD - D))
             D <<= 1
     temp_list.sort()
-    flat_data = []
-    for D, SD, sD in temp_list:
-        flat_data.extend((D, SD, sD))
+    # V2: calculer mask_pmin pour chaque driver (bitmask coprime + p_min)
+    if CYTHON_AVAILABLE:
+        flat_data = []
+        for D, SD, sD in temp_list:
+            flat_data.extend((D, SD, sD, _cython_loops.compute_mask_pmin(D)))
+    else:
+        # Fallback sans Cython: mask_pmin = 0 (pas de bitmask, p_min sera recalculé)
+        flat_data = []
+        _P_MIN_SMALL = [3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59]
+        _PRIMES_24 = [3,5,7,11,13,17,19,23,29,31,37,41,43,47,53,59,61,67,71,73,79,83,89,97]
+        for D, SD, sD in temp_list:
+            mask = 0
+            p_min_idx = 15
+            for bit, p in enumerate(_PRIMES_24[:15]):
+                if D % p == 0:
+                    mask |= (1 << bit)
+                elif p_min_idx == 15:
+                    p_min_idx = bit
+            for bit in range(15, 24):
+                if D % _PRIMES_24[bit] == 0:
+                    mask |= (1 << bit)
+            flat_data.extend((D, SD, sD, mask | (p_min_idx << 24)))
     return flat_data, len(temp_list)
 
-def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, extra_primes=None, max_depth=6):
+def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=311, extra_primes=None, max_depth=5):
     print(f"[Drivers] Génération DFS (B={smooth_bound}, depth={max_depth})...")
     start = time.time()
     n_cible_int = int(n_cible)
@@ -1148,13 +1285,13 @@ def generate_drivers_optimized(n_cible, val_max_coche=None, smooth_bound=170, ex
     del drivers_odd
     elapsed = time.time() - start
     _stats.driver_generation_time = elapsed
-    ram_mb = n_drivers * 24 / 1024 / 1024
+    ram_mb = n_drivers * 32 / 1024 / 1024
     print(f"[Drivers] OK {n_drivers} drivers en {elapsed:.2f}s ({ram_mb:.0f} MB)")
     return (flat_data, n_drivers)
 
 def get_cached_drivers(n_cible, val_max_coche, smooth_bound, extra_primes, max_depth, use_compression=False):
     primes_key = hashlib.md5(str(sorted(extra_primes or [])).encode()).hexdigest()[:12]
-    cache_base = f"drivers_v5_B{smooth_bound}_D{max_depth}_P{primes_key}"
+    cache_base = f"drivers_v6_B{smooth_bound}_D{max_depth}_P{primes_key}"
     cache_name = f"{cache_base}.cache.gz" if use_compression else f"{cache_base}.cache"
     flat_data = None
     n_drivers = 0
@@ -1168,8 +1305,14 @@ def get_cached_drivers(n_cible, val_max_coche, smooth_bound, extra_primes, max_d
                 with open(cache_name, 'rb') as f:
                     flat_data, n_drivers = pickle.load(f)
             size_mb = os.path.getsize(cache_name) / 1024 / 1024
-            print(f"[Cache] OK Chargé : {n_drivers} drivers ({size_mb:.1f} MB)")
-            _stats.cache_hits += 1
+            # V6: validate 4 fields per driver
+            if len(flat_data) != n_drivers * 4:
+                print(f"[Cache] X Format ancien ({len(flat_data)//n_drivers} champs), régénération...")
+                flat_data = None
+                _stats.cache_misses += 1
+            else:
+                print(f"[Cache] OK Chargé : {n_drivers} drivers ({size_mb:.1f} MB)")
+                _stats.cache_hits += 1
         except Exception as e:
             print(f"[Cache] X Erreur : {e}, régénération...")
             flat_data = None
@@ -1194,7 +1337,7 @@ def get_cached_drivers(n_cible, val_max_coche, smooth_bound, extra_primes, max_d
         except Exception as e:
             print(f"[Cache] X Erreur de sauvegarde : {e}")
     print(f"[Drivers] Mise en mémoire partagée...")
-    shared = SharedArray('q', n_drivers * 3, lock=False)
+    shared = SharedArray('q', n_drivers * 4, lock=False)
     shared[:] = flat_data
     del flat_data
     return (shared, n_drivers)
@@ -1207,6 +1350,9 @@ _worker_drivers = None
 _worker_n_drivers = 0
 
 def _sieve_primes(limit):
+    # P4: Cython si disponible (5-10x plus rapide)
+    if CYTHON_AVAILABLE:
+        return _cython_loops.sieve_primes(limit)
     is_p = bytearray(b'\x01') * (limit + 1)
     is_p[0] = is_p[1] = 0
     for i in range(2, int(limit**0.5) + 1):
@@ -1214,13 +1360,44 @@ def _sieve_primes(limit):
             is_p[i*i::i] = bytearray(len(is_p[i*i::i]))
     return tuple(i for i in range(2, limit + 1) if is_p[i])
 
-_SEMI_DIRECT_PRIMES = _sieve_primes(1_000_000)
+# P3: Crible etendu a 10^7 (664k premiers au lieu de 78k)
+_sieve_start = time.time()
+_SEMI_DIRECT_PRIMES = _sieve_primes(10_000_000)
 _SEMI_DIRECT_P_MAX = _SEMI_DIRECT_PRIMES[-1]
+_sieve_elapsed = time.time() - _sieve_start
+_sieve_method = "Cython" if CYTHON_AVAILABLE else "Python"
+print(f"[P3] OK {len(_SEMI_DIRECT_PRIMES):,} premiers cribles en {_sieve_elapsed:.2f}s (max={_SEMI_DIRECT_P_MAX:,}) [{_sieve_method}]")
 
 def init_worker_with_drivers(drivers_tuple):
-    global _worker_drivers, _worker_n_drivers
+    global _worker_drivers, _worker_n_drivers, _worker_drv_np, _worker_sieve_np
     _worker_drivers, _worker_n_drivers = drivers_tuple
     signal.signal(signal.SIGINT, signal.SIG_IGN)
+    # P7: Pré-calculer les numpy arrays pour Cython (zero-copy)
+    if CYTHON_AVAILABLE:
+        import numpy as np
+        _worker_drv_np = np.frombuffer(_worker_drivers, dtype=np.int64)
+        _worker_sieve_np = np.array(_SEMI_DIRECT_PRIMES, dtype=np.int64)
+    else:
+        _worker_drv_np = None
+        _worker_sieve_np = None
+
+def _get_D_factors_set(D_int):
+    """Pre-factorise D pour test coprimality O(1)."""
+    _D_factors = set()
+    _tmp_D = D_int
+    for _sp in _SMALL_PRIMES_EXTENDED:
+        if _sp == 2:
+            continue
+        if _tmp_D % _sp == 0:
+            _D_factors.add(_sp)
+            while _tmp_D % _sp == 0:
+                _tmp_D //= _sp
+        if _tmp_D == 1:
+            break
+    if _tmp_D > 1:
+        _D_factors.add(_tmp_D)
+    return _D_factors
+
 
 def worker_search_partial(args):
     """
@@ -1275,279 +1452,442 @@ def worker_search_partial(args):
     
     # Phase 2 : Drivers [drv_start, drv_end) — AVEC FILTRES
     _pretest_keys = set(solutions.keys())
+    effective_end = drv_end  # Par défaut, sera réduit par bisect si nécessaire
     
     if drv is not None and drv_end > drv_start:
         
         # ============================================================
-        # FILTRE 1 : Recherche binaire — éliminer D > node en O(log n)
-        # Les drivers sont triés par D croissant.
+        # P4/P7: FAST PATH CYTHON — boucle principale fusionnée en C
+        # Direct + filtres + Semi-direct en un seul appel C.
+        # Les candidats retournés sont vérifiés is_prime en Python.
         # ============================================================
-        effective_end = drv_end
-        if drv[(drv_end - 1) * 3] > node_int:
-            lo, hi = drv_start, drv_end - 1
-            while lo < hi:
-                mid = (lo + hi) // 2
-                if drv[mid * 3] <= node_int:
-                    lo = mid + 1
-                else:
-                    hi = mid
-            effective_end = lo
-            lf['filtered_bisect'] += (drv_end - effective_end)
-        
-        lf['drivers_tested'] += (drv_end - drv_start)
-        
-        for idx in range(drv_start, effective_end):
-            off = idx * 3
-            D_int = drv[off]
-            SD_int = drv[off + 1]
-            if SD_int > node_int:
-                continue
-            sD = drv[off + 2]
-            if sD <= 0:
-                continue
+        if CYTHON_AVAILABLE:
+            global _worker_drv_np, _worker_sieve_np
             
-            # Direct: k = D * q (test O(1) — toujours exécuté)
-            num_direct = node_int - SD_int
-            if num_direct > 0 and num_direct % sD == 0:
-                q_full = num_direct // sD
-                if q_full > 1 and D_int % q_full != 0:
-                    if gmpy2.is_prime(q_full):
-                        k = D_int * q_full
-                        if k not in _pretest_keys:
-                            if int(sigma_optimized(k)) - k == node_int:
-                                solutions[k] = f"D({D_int})"
-                    elif q_full < 1_000_000 and math.gcd(D_int, q_full) == 1:
-                        k = D_int * q_full
-                        if k not in _pretest_keys:
-                            if int(sigma_optimized(k)) - k == node_int:
-                                solutions[k] = f"Multi({D_int})"
+            direct_cands, semi_cands, c_stats = _cython_loops.driver_loop_direct_semi(
+                node_int, _worker_drv_np, drv_start, drv_end,
+                _worker_sieve_np, len(_SEMI_DIRECT_PRIMES), _SEMI_DIRECT_P_MAX
+            )
             
-            # ============================================================
-            # FILTRE 2 : p_min — plus petit premier copremier à D
-            # Si σ(D)×(1+p_min) > node, aucun premier p ne donne une
-            # solution semi-directe ni quadratique → skip complet.
-            # ============================================================
-            p_min = _smallest_coprime_prime(D_int)
-            if SD_int * (1 + p_min) > node_int:
-                lf['filtered_pmin'] += 1
-                continue
+            # Accumuler les stats Cython
+            lf['drivers_tested'] += c_stats.get('drivers_tested', 0)
+            lf['filtered_bisect'] += c_stats.get('filtered_bisect', 0)
+            lf['filtered_pmin'] += c_stats.get('filtered_pmin', 0)
+            lf['filtered_qmax'] += c_stats.get('filtered_qmax', 0)
+            lf['filtered_pmax_lt_pmin'] += c_stats.get('filtered_pmax_lt_pmin', 0)
+            lf['entered_semi_direct'] += c_stats.get('entered_semi_direct', 0)
             
-            # ============================================================
-            # FILTRE 3 (PRE-ISQRT) : q(p_min) ≤ p_min → skip
-            # q est décroissant en p. Si q(p_min) ≤ p_min, aucun
-            # couple (p,q) avec q > p n'existe.
-            # Équivalent à p_min ≥ p_max_needed mais SANS isqrt.
-            # Coût : 2 multiplications + 1 comparaison.
-            # ============================================================
-            target_q = sD * node_int + SD_int * D_int
-            if target_q <= 0:
-                continue
-            
-            # q(p_min) = num_qmin / den_qmin ; skip si ≤ p_min
-            num_qmin = node_int - SD_int * (1 + p_min)  # > 0 (filtre 2 passé)
-            den_qmin = SD_int + p_min * sD
-            if num_qmin <= p_min * den_qmin:
-                lf['filtered_qmax'] += 1
-                continue
-            
-            # ============================================================
-            # ISQRT + p_max (nécessaire pour borner les boucles)
-            # ============================================================
-            sqrt_target_int = int(gmpy2.isqrt(target_q))
-            p_max_needed = (sqrt_target_int - SD_int) // sD
-            
-            # Sécurité: si arrondi d'isqrt donne p_max < p_min (rare)
-            if p_max_needed < p_min:
-                lf['filtered_pmax_lt_pmin'] += 1
-                continue
-            
-            # ========================================================
-            # Semi-direct : k = D * p * q (sieve rapide, p ≤ 10^6)
-            # ========================================================
-            if p_max_needed <= _SEMI_DIRECT_P_MAX:
-                lf['entered_semi_direct'] += 1
-                
-                # Pour grands p_max, pré-calculer les facteurs de D
-                # pour remplacer D_int % p (division bigint) par
-                # un test d'appartenance O(1) dans un set.
-                if p_max_needed > 200:
-                    _D_factors = set()
-                    _tmp_D = D_int
-                    # Use _SMALL_PRIMES_EXTENDED (up to 541) instead of stopping at 113
-                    for _sp in _SMALL_PRIMES_EXTENDED:
-                        if _sp == 2:
-                            continue  # D is always even, skip 2
-                        if _tmp_D % _sp == 0:
-                            _D_factors.add(_sp)
-                            while _tmp_D % _sp == 0:
-                                _tmp_D //= _sp
-                        if _tmp_D == 1:
-                            break
-                    # If _tmp_D > 1, a large prime factor remains
-                    if _tmp_D > 1:
-                        _D_factors.add(_tmp_D)
-                    
-                    for p in _SEMI_DIRECT_PRIMES:
-                        if p > p_max_needed:
-                            break
-                        if p in _D_factors:
-                            continue
-                        SD_1p = SD_int * (1 + p)
-                        if SD_1p > node_int:
-                            break
-                        num_q = node_int - SD_1p
-                        den = SD_int + p * sD
-                        if num_q % den != 0:
-                            continue
-                        q_v = num_q // den
-                        if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
-                            continue
-                        k_semi = D_int * p * q_v
-                        if k_semi not in _pretest_keys:
-                            if int(sigma_optimized(k_semi)) - k_semi == node_int:
-                                solutions[k_semi] = f"S({D_int})"
-                else:
-                    for p in _SEMI_DIRECT_PRIMES:
-                        if p > p_max_needed:
-                            break
-                        if D_int % p == 0:
-                            continue
-                        SD_1p = SD_int * (1 + p)
-                        if SD_1p > node_int:
-                            break
-                        num_q = node_int - SD_1p
-                        den = SD_int + p * sD
-                        if num_q % den != 0:
-                            continue
-                        q_v = num_q // den
-                        if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
-                            continue
-                        k_semi = D_int * p * q_v
-                        if k_semi not in _pretest_keys:
-                            if int(sigma_optimized(k_semi)) - k_semi == node_int:
-                                solutions[k_semi] = f"S({D_int})"
-            
-            # ========================================================
-            # Quadratic : recherche de paires (p,q) via diviseurs
-            # de target_q = (SD + sD·p)(SD + sD·q)
-            # ========================================================
-            if target_q > MAX_TARGET_QUADRATIC:
-                continue
-            
-            # Borne inférieure : p_start évite de retester les p
-            # déjà couverts par Semi-direct
-            if p_max_needed <= _SEMI_DIRECT_P_MAX:
-                p_start = _SEMI_DIRECT_P_MAX + 1
-            else:
-                p_start = p_min
-            div_min = p_start * sD + SD_int
-            
-            # Rien à chercher si div_min > √target_q
-            if div_min > sqrt_target_int:
-                continue
-            
-            n_quad_iters = (sqrt_target_int - div_min) // sD + 1
-            
-            if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
-                continue
-            
-            # ============================================================
-            # STRATÉGIE ADAPTATIVE :
-            # - Peu d'itérations (≤ 300) → scan linéaire direct.
-            #   Le scan est MOINS cher que is_prime(target_q) (~5µs)
-            #   car 300 × modulo < Miller-Rabin. On ne teste donc
-            #   PAS la primalité ici — si target_q est premier, le
-            #   scan ne trouvera rien en ~15µs (acceptable).
-            #
-            # - Beaucoup d'itérations (> 300) → tester is_prime d'abord
-            #   (évite une factorisation coûteuse pour ~5% des cas),
-            #   puis factoriser target_q et énumérer ses diviseurs.
-            # ============================================================
-            if n_quad_iters > 300:
-                # Test primalité UNIQUEMENT pour le path factorisé
-                if gmpy2.is_prime(target_q):
-                    lf['filtered_tq_prime'] += 1
+            # Vérifier les candidats Direct
+            for k_cand, D_cand, q_cand in direct_cands:
+                if k_cand in _pretest_keys:
                     continue
+                if gmpy2.is_prime(q_cand):
+                    if int(sigma_optimized(k_cand)) - k_cand == node_int:
+                        solutions[k_cand] = f"D({D_cand})"
+                elif q_cand < 1_000_000 and math.gcd(D_cand, q_cand) == 1:
+                    if int(sigma_optimized(k_cand)) - k_cand == node_int:
+                        solutions[k_cand] = f"Multi({D_cand})"
+            
+            # Vérifier les candidats Semi-direct
+            for k_cand, D_cand, p_cand, q_cand in semi_cands:
+                if k_cand in _pretest_keys:
+                    continue
+                if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand):
+                    if int(sigma_optimized(k_cand)) - k_cand == node_int:
+                        solutions[k_cand] = f"S({D_cand})"
+            
+            # Quadratic: toujours en Python (rare, > 10^14)
+            # Short-circuit: Quadratic ne s'active que quand p_max > SEMI_DIRECT_P_MAX
+            # ce qui requiert target_q assez grand. Pour le plus petit driver D=2 (sD=1),
+            # p_max ≈ sqrt(node) → p_max > 10^7 ssi node > 10^14.
+            # On ne re-scanne les drivers que si node est assez grand.
+            quadratic_threshold = _SEMI_DIRECT_P_MAX * _SEMI_DIRECT_P_MAX  # ~10^14
+            if node_int > quadratic_threshold:
+                effective_end_q = drv_end
+                if drv[(drv_end - 1) * 4] > node_int:
+                    lo, hi = drv_start, drv_end - 1
+                    while lo < hi:
+                        mid = (lo + hi) // 2
+                        if drv[mid * 4] <= node_int:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    effective_end_q = lo
+            
+                for idx in range(drv_start, effective_end_q):
+                    off = idx * 4
+                    D_int = drv[off]
+                    SD_int = drv[off + 1]
+                    if SD_int > node_int:
+                        continue
+                    sD = drv[off + 2]
+                    if sD <= 0:
+                        continue
                 
-                # --- APPROCHE FACTORISÉE ---
-                divisors = get_divisors_fast(int(target_q))
-                if divisors:
-                    lf['factorized_quadratic'] += 1
-                    for d_val in divisors:
-                        if d_val > sqrt_target_int:
-                            break
-                        if d_val < div_min:
+                    p_min = _smallest_coprime_prime(D_int)
+                    if SD_int * (1 + p_min) > node_int:
+                        continue
+                    target_q = sD * node_int + SD_int * D_int
+                    if target_q <= 0 or target_q > MAX_TARGET_QUADRATIC:
+                        continue
+                    num_qmin = node_int - SD_int * (1 + p_min)
+                    den_qmin = SD_int + p_min * sD
+                    if num_qmin <= p_min * den_qmin:
+                        continue
+                    sqrt_target_int = int(gmpy2.isqrt(target_q))
+                    p_max_needed = (sqrt_target_int - SD_int) // sD
+                    if p_max_needed < p_min or p_max_needed <= _SEMI_DIRECT_P_MAX:
+                        continue
+                
+                    # Quadratic zone: p > _SEMI_DIRECT_P_MAX
+                    p_start = _SEMI_DIRECT_P_MAX + 1
+                    div_min = p_start * sD + SD_int
+                    if div_min > sqrt_target_int:
+                        continue
+                    n_quad_iters = (sqrt_target_int - div_min) // sD + 1
+                    if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
+                        continue
+                
+                    if n_quad_iters > 300:
+                        if gmpy2.is_prime(target_q):
+                            lf['filtered_tq_prime'] += 1
                             continue
-                        diff = d_val - SD_int
-                        if diff <= 0 or diff % sD != 0:
-                            continue
-                        p_v = diff // sD
-                        if p_v <= 1 or D_int % p_v == 0:
-                            continue
-                        if not gmpy2.is_prime(p_v):
-                            continue
-                        div_q = target_q // d_val
-                        diff_q = div_q - SD_int
-                        if diff_q <= 0 or diff_q % sD != 0:
-                            continue
-                        q_v = diff_q // sD
-                        if q_v <= p_v or D_int % q_v == 0:
-                            continue
-                        if gmpy2.is_prime(q_v):
-                            k_quad = D_int * p_v * q_v
-                            if k_quad not in _pretest_keys:
-                                if int(sigma_optimized(k_quad)) - k_quad == node_int:
-                                    solutions[k_quad] = f"Q({D_int})"
-                else:
-                    # Factorisation échouée → fallback scan linéaire
-                    lf['fallback_quadratic'] += 1
-                    d = div_min
-                    while d <= sqrt_target_int:
-                        if target_q % d == 0:
-                            diff = d - SD_int
-                            if diff > 0 and diff % sD == 0:
-                                p_v = diff // sD
-                                if p_v > 1 and D_int % p_v == 0:
-                                    d += sD
+                        divisors = get_divisors_in_range(int(target_q), int(div_min), int(sqrt_target_int))
+                        if divisors:
+                            lf['factorized_quadratic'] += 1
+                            for d_val in divisors:
+                                diff = d_val - SD_int
+                                if diff <= 0 or diff % sD != 0:
                                     continue
-                                if gmpy2.is_prime(p_v):
-                                    div_q = target_q // d
-                                    diff_q = div_q - SD_int
-                                    if diff_q > 0 and diff_q % sD == 0:
-                                        q_v = diff_q // sD
-                                        if q_v > p_v and D_int % q_v != 0:
-                                            if gmpy2.is_prime(q_v):
-                                                k_quad = D_int * p_v * q_v
-                                                if k_quad not in _pretest_keys:
-                                                    if int(sigma_optimized(k_quad)) - k_quad == node_int:
-                                                        solutions[k_quad] = f"Q({D_int})"
-                        d += sD
-            else:
-                # --- SCAN LINÉAIRE DIRECT (≤ 300 itérations) ---
-                # Pas de test de primalité : le scan coûte ≤ 15µs,
-                # moins cher que is_prime (~5µs) dans 95% des cas.
-                lf['entered_quadratic'] += 1
-                d = div_min
-                while d <= sqrt_target_int:
-                    if target_q % d == 0:
-                        diff = d - SD_int
-                        if diff > 0 and diff % sD == 0:
-                            p_v = diff // sD
-                            if p_v > 1 and D_int % p_v == 0:
-                                d += sD
-                                continue
-                            if gmpy2.is_prime(p_v):
-                                div_q = target_q // d
+                                p_v = diff // sD
+                                if p_v <= 1 or D_int % p_v == 0:
+                                    continue
+                                if not gmpy2.is_prime(p_v):
+                                    continue
+                                div_q = target_q // d_val
                                 diff_q = div_q - SD_int
-                                if diff_q > 0 and diff_q % sD == 0:
-                                    q_v = diff_q // sD
-                                    if q_v > p_v and D_int % q_v != 0:
-                                        if gmpy2.is_prime(q_v):
-                                            k_quad = D_int * p_v * q_v
-                                            if k_quad not in _pretest_keys:
-                                                if int(sigma_optimized(k_quad)) - k_quad == node_int:
-                                                    solutions[k_quad] = f"Q({D_int})"
-                    d += sD
+                                if diff_q <= 0 or diff_q % sD != 0:
+                                    continue
+                                q_v = diff_q // sD
+                                if q_v <= p_v or D_int % q_v == 0:
+                                    continue
+                                if gmpy2.is_prime(q_v):
+                                    k_quad = D_int * p_v * q_v
+                                    if k_quad not in _pretest_keys:
+                                        if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                            solutions[k_quad] = f"Q({D_int})"
+                        else:
+                            lf['fallback_quadratic'] += 1
+                            pq_candidates = _cython_loops.quadratic_scan_fallback(
+                                target_q, div_min, sqrt_target_int, sD, SD_int, D_int
+                            )
+                            for p_v, q_v in pq_candidates:
+                                if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
+                                    k_quad = D_int * p_v * q_v
+                                    if k_quad not in _pretest_keys:
+                                        if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                            solutions[k_quad] = f"Q({D_int})"
+                    else:
+                        lf['entered_quadratic'] += 1
+                        pq_candidates = _cython_loops.quadratic_scan(
+                            target_q, div_min, sqrt_target_int, sD, SD_int, D_int
+                        )
+                        for p_v, q_v in pq_candidates:
+                            if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
+                                k_quad = D_int * p_v * q_v
+                                if k_quad not in _pretest_keys:
+                                    if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                        solutions[k_quad] = f"Q({D_int})"
+        
+            else:
+                # ============================================================
+                # FALLBACK PYTHON — boucle originale sans Cython
+                # ============================================================
+                # FILTRE 1 : Recherche binaire — éliminer D > node en O(log n)
+                # Les drivers sont triés par D croissant.
+                # ============================================================
+                effective_end = drv_end
+                if drv[(drv_end - 1) * 4] > node_int:
+                    lo, hi = drv_start, drv_end - 1
+                    while lo < hi:
+                        mid = (lo + hi) // 2
+                        if drv[mid * 4] <= node_int:
+                            lo = mid + 1
+                        else:
+                            hi = mid
+                    effective_end = lo
+                    lf['filtered_bisect'] += (drv_end - effective_end)
+        
+                lf['drivers_tested'] += (drv_end - drv_start)
+        
+                for idx in range(drv_start, effective_end):
+                    off = idx * 4
+                    D_int = drv[off]
+                    SD_int = drv[off + 1]
+                    if SD_int > node_int:
+                        continue
+                    sD = drv[off + 2]
+                    if sD <= 0:
+                        continue
+            
+                    # Direct: k = D * q (test O(1) — toujours exécuté)
+                    num_direct = node_int - SD_int
+                    if num_direct > 0 and num_direct % sD == 0:
+                        q_full = num_direct // sD
+                        if q_full > 1 and D_int % q_full != 0:
+                            if gmpy2.is_prime(q_full):
+                                k = D_int * q_full
+                                if k not in _pretest_keys:
+                                    if int(sigma_optimized(k)) - k == node_int:
+                                        solutions[k] = f"D({D_int})"
+                            elif q_full < 1_000_000 and math.gcd(D_int, q_full) == 1:
+                                k = D_int * q_full
+                                if k not in _pretest_keys:
+                                    if int(sigma_optimized(k)) - k == node_int:
+                                        solutions[k] = f"Multi({D_int})"
+            
+                    # ============================================================
+                    # FILTRE 2 : p_min — plus petit premier copremier à D
+                    # Si σ(D)×(1+p_min) > node, aucun premier p ne donne une
+                    # solution semi-directe ni quadratique → skip complet.
+                    # ============================================================
+                    p_min = _smallest_coprime_prime(D_int)
+                    if SD_int * (1 + p_min) > node_int:
+                        lf['filtered_pmin'] += 1
+                        continue
+            
+                    # ============================================================
+                    # FILTRE 3 (PRE-ISQRT) : q(p_min) ≤ p_min → skip
+                    # q est décroissant en p. Si q(p_min) ≤ p_min, aucun
+                    # couple (p,q) avec q > p n'existe.
+                    # Équivalent à p_min ≥ p_max_needed mais SANS isqrt.
+                    # Coût : 2 multiplications + 1 comparaison.
+                    # ============================================================
+                    target_q = sD * node_int + SD_int * D_int
+                    if target_q <= 0:
+                        continue
+            
+                    # q(p_min) = num_qmin / den_qmin ; skip si ≤ p_min
+                    num_qmin = node_int - SD_int * (1 + p_min)  # > 0 (filtre 2 passé)
+                    den_qmin = SD_int + p_min * sD
+                    if num_qmin <= p_min * den_qmin:
+                        lf['filtered_qmax'] += 1
+                        continue
+            
+                    # ============================================================
+                    # ISQRT + p_max (nécessaire pour borner les boucles)
+                    # ============================================================
+                    sqrt_target_int = int(gmpy2.isqrt(target_q))
+                    p_max_needed = (sqrt_target_int - SD_int) // sD
+            
+                    # Sécurité: si arrondi d'isqrt donne p_max < p_min (rare)
+                    if p_max_needed < p_min:
+                        lf['filtered_pmax_lt_pmin'] += 1
+                        continue
+            
+                    # ========================================================
+                    # Semi-direct : k = D * p * q (sieve rapide, p ≤ 10^6)
+                    # ========================================================
+                    if p_max_needed <= _SEMI_DIRECT_P_MAX:
+                        lf['entered_semi_direct'] += 1
+                
+                        # P3/P4: Pre-factoriser D + Cython si disponible
+                        D_factors = _get_D_factors_set(D_int) if p_max_needed > 200 else set()
+                
+                        if CYTHON_AVAILABLE and p_max_needed > 500:
+                            # P4: Cython pour la boucle semi-directe
+                            candidates = _cython_loops.semi_direct_search(
+                                node_int, D_int, SD_int, sD, p_max_needed,
+                                _SEMI_DIRECT_PRIMES, D_factors
+                            )
+                            for p_v, q_v in candidates:
+                                if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
+                                    k_semi = D_int * p_v * q_v
+                                    if k_semi not in _pretest_keys:
+                                        if int(sigma_optimized(k_semi)) - k_semi == node_int:
+                                            solutions[k_semi] = f"S({D_int})"
+                        elif D_factors:
+                            for p in _SEMI_DIRECT_PRIMES:
+                                if p > p_max_needed:
+                                    break
+                                if p in D_factors:
+                                    continue
+                                SD_1p = SD_int * (1 + p)
+                                if SD_1p > node_int:
+                                    break
+                                num_q = node_int - SD_1p
+                                den = SD_int + p * sD
+                                if num_q % den != 0:
+                                    continue
+                                q_v = num_q // den
+                                if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
+                                    continue
+                                k_semi = D_int * p * q_v
+                                if k_semi not in _pretest_keys:
+                                    if int(sigma_optimized(k_semi)) - k_semi == node_int:
+                                        solutions[k_semi] = f"S({D_int})"
+                        else:
+                            for p in _SEMI_DIRECT_PRIMES:
+                                if p > p_max_needed:
+                                    break
+                                if D_int % p == 0:
+                                    continue
+                                SD_1p = SD_int * (1 + p)
+                                if SD_1p > node_int:
+                                    break
+                                num_q = node_int - SD_1p
+                                den = SD_int + p * sD
+                                if num_q % den != 0:
+                                    continue
+                                q_v = num_q // den
+                                if q_v <= p or D_int % q_v == 0 or not gmpy2.is_prime(q_v):
+                                    continue
+                                k_semi = D_int * p * q_v
+                                if k_semi not in _pretest_keys:
+                                    if int(sigma_optimized(k_semi)) - k_semi == node_int:
+                                        solutions[k_semi] = f"S({D_int})"
+            
+                    # ========================================================
+                    # Quadratic : recherche de paires (p,q) via diviseurs
+                    # de target_q = (SD + sD·p)(SD + sD·q)
+                    # ========================================================
+                    if target_q > MAX_TARGET_QUADRATIC:
+                        continue
+            
+                    # Borne inférieure : p_start évite de retester les p
+                    # déjà couverts par Semi-direct
+                    if p_max_needed <= _SEMI_DIRECT_P_MAX:
+                        p_start = _SEMI_DIRECT_P_MAX + 1
+                    else:
+                        p_start = p_min
+                    div_min = p_start * sD + SD_int
+            
+                    # Rien à chercher si div_min > √target_q
+                    if div_min > sqrt_target_int:
+                        continue
+            
+                    n_quad_iters = (sqrt_target_int - div_min) // sD + 1
+            
+                    if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
+                        continue
+            
+                    # ============================================================
+                    # STRATÉGIE ADAPTATIVE :
+                    # - Peu d'itérations (≤ 300) → scan linéaire direct.
+                    #   Le scan est MOINS cher que is_prime(target_q) (~5µs)
+                    #   car 300 × modulo < Miller-Rabin. On ne teste donc
+                    #   PAS la primalité ici — si target_q est premier, le
+                    #   scan ne trouvera rien en ~15µs (acceptable).
+                    #
+                    # - Beaucoup d'itérations (> 300) → tester is_prime d'abord
+                    #   (évite une factorisation coûteuse pour ~5% des cas),
+                    #   puis factoriser target_q et énumérer ses diviseurs.
+                    # ============================================================
+                    if n_quad_iters > 300:
+                        # Test primalité UNIQUEMENT pour le path factorisé
+                        if gmpy2.is_prime(target_q):
+                            lf['filtered_tq_prime'] += 1
+                            continue
+                
+                        # P6: APPROCHE FACTORISEE avec pruning DFS
+                        divisors = get_divisors_in_range(int(target_q), int(div_min), int(sqrt_target_int))
+                        if divisors:
+                            lf['factorized_quadratic'] += 1
+                            for d_val in divisors:
+                                diff = d_val - SD_int
+                                if diff <= 0 or diff % sD != 0:
+                                    continue
+                                p_v = diff // sD
+                                if p_v <= 1 or D_int % p_v == 0:
+                                    continue
+                                if not gmpy2.is_prime(p_v):
+                                    continue
+                                div_q = target_q // d_val
+                                diff_q = div_q - SD_int
+                                if diff_q <= 0 or diff_q % sD != 0:
+                                    continue
+                                q_v = diff_q // sD
+                                if q_v <= p_v or D_int % q_v == 0:
+                                    continue
+                                if gmpy2.is_prime(q_v):
+                                    k_quad = D_int * p_v * q_v
+                                    if k_quad not in _pretest_keys:
+                                        if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                            solutions[k_quad] = f"Q({D_int})"
+                        else:
+                            # Factorisation échouée → fallback scan linéaire
+                            lf['fallback_quadratic'] += 1
+                            # P4: Cython pour le fallback scan (3-5x plus rapide)
+                            if CYTHON_AVAILABLE:
+                                pq_candidates = _cython_loops.quadratic_scan_fallback(
+                                    target_q, div_min, sqrt_target_int, sD, SD_int, D_int
+                                )
+                                for p_v, q_v in pq_candidates:
+                                    if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
+                                        k_quad = D_int * p_v * q_v
+                                        if k_quad not in _pretest_keys:
+                                            if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                                solutions[k_quad] = f"Q({D_int})"
+                            else:
+                                d = div_min
+                                while d <= sqrt_target_int:
+                                    if target_q % d == 0:
+                                        diff = d - SD_int
+                                        if diff > 0 and diff % sD == 0:
+                                            p_v = diff // sD
+                                            if p_v > 1 and D_int % p_v == 0:
+                                                d += sD
+                                                continue
+                                            if gmpy2.is_prime(p_v):
+                                                div_q = target_q // d
+                                                diff_q = div_q - SD_int
+                                                if diff_q > 0 and diff_q % sD == 0:
+                                                    q_v = diff_q // sD
+                                                    if q_v > p_v and D_int % q_v != 0:
+                                                        if gmpy2.is_prime(q_v):
+                                                            k_quad = D_int * p_v * q_v
+                                                            if k_quad not in _pretest_keys:
+                                                                if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                                                    solutions[k_quad] = f"Q({D_int})"
+                                    d += sD
+                    else:
+                        # --- SCAN LINÉAIRE DIRECT (≤ 300 itérations) ---
+                        # Pas de test de primalité : le scan coûte ≤ 15µs,
+                        # moins cher que is_prime (~5µs) dans 95% des cas.
+                        lf['entered_quadratic'] += 1
+                        # P4: Cython pour le scan linéaire (3-5x plus rapide)
+                        if CYTHON_AVAILABLE:
+                            pq_candidates = _cython_loops.quadratic_scan(
+                                target_q, div_min, sqrt_target_int, sD, SD_int, D_int
+                            )
+                            for p_v, q_v in pq_candidates:
+                                if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
+                                    k_quad = D_int * p_v * q_v
+                                    if k_quad not in _pretest_keys:
+                                        if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                            solutions[k_quad] = f"Q({D_int})"
+                        else:
+                            d = div_min
+                            while d <= sqrt_target_int:
+                                if target_q % d == 0:
+                                    diff = d - SD_int
+                                    if diff > 0 and diff % sD == 0:
+                                        p_v = diff // sD
+                                        if p_v > 1 and D_int % p_v == 0:
+                                            d += sD
+                                            continue
+                                        if gmpy2.is_prime(p_v):
+                                            div_q = target_q // d
+                                            diff_q = div_q - SD_int
+                                            if diff_q > 0 and diff_q % sD == 0:
+                                                q_v = diff_q // sD
+                                                if q_v > p_v and D_int % q_v != 0:
+                                                    if gmpy2.is_prime(q_v):
+                                                        k_quad = D_int * p_v * q_v
+                                                        if k_quad not in _pretest_keys:
+                                                            if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                                                solutions[k_quad] = f"Q({D_int})"
+                                d += sD
     
     return (node_int, solutions, lf)
 
@@ -1559,12 +1899,11 @@ def worker_search(node):
 
 
 
-
 # ============================================================================
 # CLASSE PRINCIPALE
 # ============================================================================
 
-class ArbreAliquoteV5:
+class ArbreAliquoteV6:
     def __init__(self, n_cible, profondeur=100, smooth_bound=120, extra_primes=None, 
                  max_depth=6, use_compression=False, allow_empty_exploration=False):
         self.cible_initiale = int(n_cible)
@@ -1731,7 +2070,7 @@ class ArbreAliquoteV5:
                         current_gen = list(set(next_gen_from_cache))
                         continue
                 
-                next_gen = set()  # ✅ OPTIMISÉ: Utiliser set directement pour dédoublonnage en temps réel
+                next_gen = set()
                 processed = 0
                 
                 # ✅ MODE COOPÉRATIF : si moins de nœuds que de workers,
@@ -1799,10 +2138,7 @@ class ArbreAliquoteV5:
                             sol_prefix = sol_type.split('(')[0]
                             _stats.add_solution(sol_prefix)
                         for k in solutions:
-                            k_val = int(k)
-                            # ✅ CORRECTIF CACHE: Ajouter TOUS les enfants à next_gen
-                            # (pas seulement ceux < 100x cible)
-                            next_gen.add(k_val)
+                            next_gen.add(int(k))
                         processed += 1
                         if processed % 10 == 0:
                             print(f"\r   -> {processed}/{len(to_compute)}", end='')
@@ -2041,11 +2377,11 @@ if __name__ == "__main__":
     parser.add_argument("val_coche", type=int, help="Valeur max")
     parser.add_argument("n", type=int, help="Cible")
     parser.add_argument("--depth", type=int, default=100, help="Profondeur")
-    parser.add_argument("--smooth-bound", type=int, default=170, help="Borne B")
+    parser.add_argument("--smooth-bound", type=int, default=311, help="Borne B")
     parser.add_argument("--extra-primes", type=int, nargs='*',
-                        default=[173, 197, 211, 239, 251, 269, 313, 419, 439, 457, 541, 907],
+                        default=[313, 419, 439, 457, 541, 907],
                         help="Grands premiers")
-    parser.add_argument("--max-driver-depth", type=int, default=5,
+    parser.add_argument("--max-driver-depth", type=int, default=4,
                         help="Max premiers distincts")
     parser.add_argument("--compress", action='store_true',
                         help="Compresser le cache (gzip)")
@@ -2073,7 +2409,7 @@ if __name__ == "__main__":
             args.max_driver_depth = 8
     
     print("="*70)
-    print("  VERSION V5 - OPTIMISÉE AVEC NUMBA")
+    print("  VERSION V6 TURBO - P1:Fused-sigma P2:ECM P3:10M-sieve P4:Cython+")
     print("="*70)
     print(f"  • Cible : {args.n}")
     print(f"  • Smooth bound : {args.smooth_bound}")
@@ -2087,7 +2423,7 @@ if __name__ == "__main__":
         print(f"  • Numba : NON DISPONIBLE (pip install numba)")
     print("="*70 + "\n")
     
-    app = ArbreAliquoteV5(
+    app = ArbreAliquoteV6(
         n_cible=args.n,
         profondeur=args.depth,
         smooth_bound=args.smooth_bound,
@@ -2097,4 +2433,5 @@ if __name__ == "__main__":
         allow_empty_exploration=args.allow_empty_node_exploration
     )
     app.val_max_coche = args.val_coche
+    app.construire(reprise_active=args.resume)
     app.construire(reprise_active=args.resume)
