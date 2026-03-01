@@ -134,7 +134,11 @@ def driver_loop_direct_semi(
     """
     Boucle principale fusionnee en C: Direct + filtres + Semi-direct.
     flat_data V2: 4 champs par driver (D, SD, sD, mask_pmin).
-    Le bitmask est lu depuis mask_pmin (pré-calculé, coût runtime = 0).
+
+    Filtres V4 (fusion V2+V3):
+      - skip_all: m|SD ET m|sD ET m∤node → skip driver (m=3,4,7,11,13)
+      - p_kill: p ≡ pk (mod m) → m|den_q ET m∤num_q → skip p (m=3,7,11,13)
+      - mod8: 8|den_q ET 8∤num_q → skip p (après p_kill)
     """
     cdef long long *drv = <long long *>drv_flat.data
     cdef long long *sv = <long long *>sieve.data
@@ -146,6 +150,16 @@ def driver_loop_direct_semi(
     cdef long long p_v, SD_1p, num_q, den_q, q_v, k_semi
     cdef unsigned int div_mask
     cdef int p_min_idx
+    cdef int node_is_odd = node & 1
+
+    # Variables filtres modulaires
+    cdef int SD3, sD3, SD7, sD7, SD4, sD4, SD11, sD11, SD13, sD13
+    cdef int skip_all_3, skip_all_7, skip_all_4, skip_all_11, skip_all_13
+    cdef int node3, node7, node4, node11, node13
+    cdef int q_kill3, q_kill3_active, q_kill7, q_kill7_active
+    cdef int q_kill11, q_kill11_active, q_kill13, q_kill13_active
+    cdef int inv3, inv7, inv11, inv13, nA3, nA7, nA11, nA13
+    cdef int SD8, sD8, den_q8
 
     # Stats
     cdef long long st_drivers_tested = 0
@@ -153,10 +167,20 @@ def driver_loop_direct_semi(
     cdef long long st_filtered_pmin = 0
     cdef long long st_filtered_qmax = 0
     cdef long long st_filtered_pmax = 0
+    cdef long long st_filtered_skipall = 0
+    cdef long long st_filtered_pkill = 0
+    cdef long long st_filtered_mod8 = 0
     cdef long long st_entered_semi = 0
 
     direct_cands = []
     semi_cands = []
+
+    # Pré-calcul node mod petits premiers
+    node3 = <int>(node % 3)
+    node7 = <int>(node % 7)
+    node4 = <int>(node % 4)
+    node11 = <int>(node % 11)
+    node13 = <int>(node % 13)
 
     # Bisect: trouver effective_end (D <= node)
     cdef int effective_end = drv_end
@@ -199,9 +223,41 @@ def driver_loop_direct_semi(
         p_min_idx = <int>((mask_pmin_val >> 24) & 0xF)
         p_min = P_MIN_VALS[p_min_idx]
 
-        # ---- Filtre p_min ----
+        # ---- Node impair → skip semi-direct ----
+        if node_is_odd:
+            continue
+
+        # ---- skip_all mod4: 4|SD ET 4|sD ET 4∤node → skip ----
+        SD4 = <int>(SD % 4)
+        sD4 = <int>(sD % 4)
+        if SD4 == 0 and sD4 == 0 and node4 != 0:
+            st_filtered_skipall += 1
+            continue
+
+        # ---- Filtre p_min (quasi gratuit: 1 multiplication) ----
         if SD * (1 + p_min) > node:
             st_filtered_pmin += 1
+            continue
+
+        # ---- skip_all: m|SD ET m|sD ET m∤node → skip driver ----
+        SD3 = <int>(SD % 3)
+        sD3 = <int>(sD % 3)
+        skip_all_3 = (SD3 == 0 and sD3 == 0 and node3 != 0)
+
+        SD7 = <int>(SD % 7)
+        sD7 = <int>(sD % 7)
+        skip_all_7 = (SD7 == 0 and sD7 == 0 and node7 != 0)
+
+        SD11 = <int>(SD % 11)
+        sD11 = <int>(sD % 11)
+        skip_all_11 = (SD11 == 0 and sD11 == 0 and node11 != 0)
+
+        SD13 = <int>(SD % 13)
+        sD13 = <int>(sD % 13)
+        skip_all_13 = (SD13 == 0 and sD13 == 0 and node13 != 0)
+
+        if skip_all_3 or skip_all_7 or skip_all_11 or skip_all_13:
+            st_filtered_skipall += 1
             continue
 
         # ---- Filtre q_max (pre-isqrt) ----
@@ -229,13 +285,54 @@ def driver_loop_direct_semi(
 
         st_entered_semi += 1
 
+        # ---- p_kill: pré-calculer résidus tueurs mod 3, 7, 11, 13 ----
+        nA3 = <int>((node - SD) % 3)
+        q_kill3_active = 0
+        q_kill3 = 0
+        if sD % 3 != 0:
+            inv3 = <int>(sD % 3)
+            q_kill3 = (3 - (SD % 3 * inv3) % 3) % 3
+            if (nA3 - SD % 3 * q_kill3 % 3 + 9) % 3 != 0:
+                q_kill3_active = 1
+
+        nA7 = <int>((node - SD) % 7)
+        q_kill7_active = 0
+        q_kill7 = 0
+        if sD % 7 != 0:
+            inv7 = [0,1,4,5,2,3,6][<int>(sD % 7)]
+            q_kill7 = (7 - (SD % 7 * inv7) % 7) % 7
+            if (nA7 - SD % 7 * q_kill7 % 7 + 49) % 7 != 0:
+                q_kill7_active = 1
+
+        nA11 = <int>((node - SD) % 11)
+        q_kill11_active = 0
+        q_kill11 = 0
+        if sD % 11 != 0:
+            inv11 = [0,1,6,4,3,9,2,8,7,5,10][<int>(sD % 11)]
+            q_kill11 = (11 - (SD % 11 * inv11) % 11) % 11
+            if (nA11 - SD % 11 * q_kill11 % 11 + 121) % 11 != 0:
+                q_kill11_active = 1
+
+        nA13 = <int>((node - SD) % 13)
+        q_kill13_active = 0
+        q_kill13 = 0
+        if sD % 13 != 0:
+            inv13 = [0,1,7,9,10,8,11,2,5,3,4,6,12][<int>(sD % 13)]
+            q_kill13 = (13 - (SD % 13 * inv13) % 13) % 13
+            if (nA13 - SD % 13 * q_kill13 % 13 + 169) % 13 != 0:
+                q_kill13_active = 1
+
+        # Pré-calcul mod8 pour le driver
+        SD8 = <int>(SD % 8)
+        sD8 = <int>(sD % 8)
+
         # Boucle sur le crible (skip p=2)
         for pi in range(1, sieve_len):
             p_v = sv[pi]
             if p_v > p_max:
                 break
 
-            # Bitmask: pi=1..24 → bit (pi-1), coût = 1 cycle au lieu de 22
+            # Bitmask: pi=1..24 → bit (pi-1)
             if pi <= N_SMALL:
                 if (div_mask >> (pi - 1)) & 1:
                     continue
@@ -243,12 +340,33 @@ def driver_loop_direct_semi(
                 if D % p_v == 0:
                     continue
 
+            # p_kill: résidus modulaires → skip avant calcul
+            if q_kill3_active and p_v % 3 == q_kill3:
+                st_filtered_pkill += 1
+                continue
+            if q_kill7_active and p_v % 7 == q_kill7:
+                st_filtered_pkill += 1
+                continue
+            if q_kill11_active and p_v % 11 == q_kill11:
+                st_filtered_pkill += 1
+                continue
+            if q_kill13_active and p_v % 13 == q_kill13:
+                st_filtered_pkill += 1
+                continue
+
             SD_1p = SD * (1 + p_v)
             if SD_1p > node:
                 break
 
             num_q = node - SD_1p
             den_q = SD + p_v * sD
+
+            # mod8 filter: 8|den_q ET 8∤num_q → skip
+            den_q8 = <int>((SD8 + (p_v & 7) * sD8) & 7)
+            if den_q8 == 0 and (num_q & 7) != 0:
+                st_filtered_mod8 += 1
+                continue
+
             if num_q % den_q != 0:
                 continue
 
@@ -262,13 +380,354 @@ def driver_loop_direct_semi(
     stats = {
         'drivers_tested': st_drivers_tested,
         'filtered_bisect': st_filtered_bisect,
+        'filtered_skipall': st_filtered_skipall,
         'filtered_pmin': st_filtered_pmin,
         'filtered_qmax': st_filtered_qmax,
         'filtered_pmax_lt_pmin': st_filtered_pmax,
+        'filtered_pkill': st_filtered_pkill,
+        'filtered_mod8': st_filtered_mod8,
         'entered_semi_direct': st_entered_semi,
     }
 
     return direct_cands, semi_cands, stats
+
+
+# ============================================================================
+# Méthode Cubic: k = D * p * q * r  (p < q < r premiers, copremiers à D)
+# ============================================================================
+def cubic_loop(
+    long long node,
+    np.ndarray[np.int64_t, ndim=1] drv_flat,
+    int drv_start,
+    int drv_end,
+    np.ndarray[np.int64_t, ndim=1] sieve,
+    int sieve_len,
+):
+    """
+    Cubic search: k = D * p * q * r  (p < q < r premiers, copremiers à D).
+
+    Bornes:
+      p < cbrt(node / SD)
+      q > p,  q < sqrt(node / (SD * (1+p)))
+      r = (node - SDp*(1+q)) / (SDp + q*sDp),  doit être > q et premier
+
+    Filtres (V2):
+      - node impair → 0 solutions (den_r toujours pair, num_r impair)
+      - Bitmask de D réutilisé pour p et q copremiers à D
+      - skip_all mod m: si m|SDp ET m|sDp ET m∤(node-SDp) → skip paire entière
+        (den_r ≡ 0 mod m pour tout q, mais num_r ≢ 0 → jamais divisible)
+      - per-q residue: q ≡ q_kill (mod m) → m|den_r ET m∤num_r → skip
+      - Appliqué pour m = 3 et m = 7
+
+    flat_data V2: 4 champs par driver (D, SD, sD, mask_pmin).
+    """
+    cdef long long *drv = <long long *>drv_flat.data
+    cdef long long *sv = <long long *>sieve.data
+
+    cdef int idx, off, pi_p, pi_q
+    cdef long long D, SD, sD, mask_pmin_val
+    cdef long long p_v, q_v, r_v, k_cubic
+    cdef long long Dp, SDp, sDp
+    cdef long long SD1q, num_r, den_r
+    cdef double cbrt_val, q_max_f
+    cdef long long p_max_cubic, q_max_cubic
+    cdef unsigned int div_mask
+    cdef int qi_lo, qi_hi, qi_mid
+
+    # Variables pour les filtres modulaires pré-calculés
+    cdef int SDp3, sDp3, nA3, SDp7, sDp7, nA7
+    cdef int SDp5, sDp5, nA5, SDp11, sDp11, nA11, SDp13, sDp13, nA13
+    cdef int skip_all_3, skip_all_7, skip_all_5, skip_all_11, skip_all_13
+    cdef int skip_all_v2
+    cdef int SDp4, sDp4
+    cdef int q_kill3, q_kill3_active  # résidu q mod 3 à skip (-1 = inactif)
+    cdef int q_kill7, q_kill7_active
+    cdef int q_kill5, q_kill5_active
+    cdef int inv3, inv7, inv5, nat3, nat7, nat5
+
+    # Filtre v2: au niveau PAIRE — si v2(den_r) > v2(node) pour tout q impair → skip paire
+    cdef long long v2_mask
+    cdef long long node_tmp = node
+    cdef int v2_node = 0
+
+    # Stats
+    cdef long long st_drivers = 0
+    cdef long long st_p_tested = 0
+    cdef long long st_pairs_survived = 0
+    cdef long long st_q_tested = 0
+    cdef long long st_skip_pair = 0
+    cdef long long st_skip_mod = 0
+    cdef long long st_skip_v2 = 0
+    cdef long long st_skip_idiv = 0
+    cdef long long st_hits = 0
+
+    cubic_cands = []
+
+    # Node impair → aucun hit cubic possible
+    if node & 1:
+        stats = {
+            'drivers': 0, 'p_tested': 0, 'pairs_survived': 0,
+            'q_tested': 0, 'skip_pair': 0, 'skip_mod': 0, 'skip_idiv': 0, 'hits': 0,
+        }
+        return cubic_cands, stats
+
+    # Pré-calcul v2_mask: (den_r & v2_mask) == 0 → v2(den_r) > v2(node) → skip
+    # Car v2(num_r) = v2(node) toujours (node pair, SDp*(1+q) ≡ 0 mod 4*node_v2)
+    node_tmp = node
+    v2_node = 0
+    while (node_tmp & 1) == 0:
+        v2_node += 1
+        node_tmp >>= 1
+    v2_mask = (1LL << (v2_node + 1)) - 1  # ex: v2=1 → mask=3, v2=2 → mask=7
+
+    # Bisect: trouver effective_end (D <= node)
+    cdef int effective_end = drv_end
+    cdef int lo, hi, mid
+
+    if drv[(drv_end - 1) * 4] > node:
+        lo = drv_start
+        hi = drv_end - 1
+        while lo < hi:
+            mid = (lo + hi) // 2
+            if drv[mid * 4] <= node:
+                lo = mid + 1
+            else:
+                hi = mid
+        effective_end = lo
+
+    for idx in range(drv_start, effective_end):
+        off = idx * 4
+        D = drv[off]
+        SD = drv[off + 1]
+        sD = drv[off + 2]
+        mask_pmin_val = drv[off + 3]
+
+        if SD > node or sD <= 0:
+            continue
+
+        st_drivers += 1
+
+        # Extraire bitmask
+        div_mask = <unsigned int>(mask_pmin_val & 0xFFFFFF)
+
+        # Borne cubique: p < cbrt(node / SD)
+        cbrt_val = (<double>node / <double>SD)
+        if cbrt_val <= 27.0:
+            continue
+        cbrt_val = cbrt_val ** (1.0 / 3.0)
+        p_max_cubic = <long long>cbrt_val
+        if p_max_cubic < 3:
+            continue
+
+        # Boucle sur p
+        for pi_p in range(1, sieve_len):
+            p_v = sv[pi_p]
+            if p_v > p_max_cubic:
+                break
+
+            # p copremier à D
+            if pi_p <= N_SMALL:
+                if (div_mask >> (pi_p - 1)) & 1:
+                    continue
+            else:
+                if D % p_v == 0:
+                    continue
+
+            st_p_tested += 1
+
+            Dp = D * p_v
+            if Dp > node:
+                break
+
+            SDp = SD * (1 + p_v)
+            sDp = SDp - Dp
+
+            if SDp > node or sDp <= 0:
+                continue
+
+            # Borne sqrt sur q
+            q_max_f = sqrt(<double>node / <double>SDp) - 1.0
+            q_max_cubic = <long long>q_max_f
+            if q_max_cubic <= p_v:
+                continue
+
+            # ============================================================
+            # FILTRES MODULAIRES PRÉ-CALCULÉS pour cette paire (D,p)
+            # skip_all: m|SDp ET m|sDp ET m∤(node-SDp) → skip paire
+            # q_kill: q ≡ qk (mod m) → m|den_r ET m∤num_r → skip q
+            # ============================================================
+
+            # --- mod 3 ---
+            SDp3 = <int>(SDp % 3)
+            sDp3 = <int>(sDp % 3)
+            nA3 = <int>((node - SDp) % 3)
+            skip_all_3 = 0
+            q_kill3_active = 0
+            q_kill3 = 0
+
+            if sDp3 == 0:
+                if SDp3 == 0 and nA3 != 0:
+                    skip_all_3 = 1
+            else:
+                inv3 = sDp3
+                q_kill3 = (3 - (SDp3 * inv3) % 3) % 3
+                nat3 = (nA3 - SDp3 * q_kill3 % 3 + 9) % 3
+                if nat3 != 0:
+                    q_kill3_active = 1
+
+            # --- mod 5 ---
+            SDp5 = <int>(SDp % 5)
+            sDp5 = <int>(sDp % 5)
+            nA5 = <int>((node - SDp) % 5)
+            skip_all_5 = 0
+            q_kill5_active = 0
+            q_kill5 = 0
+
+            if sDp5 == 0:
+                if SDp5 == 0 and nA5 != 0:
+                    skip_all_5 = 1
+            else:
+                # inv(1,5)=1, inv(2,5)=3, inv(3,5)=2, inv(4,5)=4
+                if sDp5 == 1: inv5 = 1
+                elif sDp5 == 2: inv5 = 3
+                elif sDp5 == 3: inv5 = 2
+                else: inv5 = 4
+                q_kill5 = (5 - (SDp5 * inv5) % 5) % 5
+                nat5 = (nA5 - SDp5 * q_kill5 % 5 + 25) % 5
+                if nat5 != 0:
+                    q_kill5_active = 1
+
+            # --- mod 7 ---
+            SDp7 = <int>(SDp % 7)
+            sDp7 = <int>(sDp % 7)
+            nA7 = <int>((node - SDp) % 7)
+            skip_all_7 = 0
+            q_kill7_active = 0
+            q_kill7 = 0
+
+            if sDp7 == 0:
+                if SDp7 == 0 and nA7 != 0:
+                    skip_all_7 = 1
+            else:
+                if sDp7 == 1: inv7 = 1
+                elif sDp7 == 2: inv7 = 4
+                elif sDp7 == 3: inv7 = 5
+                elif sDp7 == 4: inv7 = 2
+                elif sDp7 == 5: inv7 = 3
+                else: inv7 = 6
+                q_kill7 = (7 - (SDp7 * inv7) % 7) % 7
+                nat7 = (nA7 - SDp7 * q_kill7 % 7 + 49) % 7
+                if nat7 != 0:
+                    q_kill7_active = 1
+
+            # --- mod 11 ---
+            SDp11 = <int>(SDp % 11)
+            sDp11 = <int>(sDp % 11)
+            nA11 = <int>((node - SDp) % 11)
+            skip_all_11 = (sDp11 == 0 and SDp11 == 0 and nA11 != 0)
+
+            # --- mod 13 ---
+            SDp13 = <int>(SDp % 13)
+            sDp13 = <int>(sDp % 13)
+            nA13 = <int>((node - SDp) % 13)
+            skip_all_13 = (sDp13 == 0 and SDp13 == 0 and nA13 != 0)
+
+            # Skip paire entière?
+            if skip_all_3 or skip_all_5 or skip_all_7 or skip_all_11 or skip_all_13:
+                st_skip_pair += 1
+                continue
+
+            # skip_all_v2: si v2(den_r) > v2(node) pour TOUT q impair → skip paire
+            # Pour v2_node=1 (v2_mask=3): (SDp%4==0 et sDp%4==0) ou (SDp%4==2 et sDp%4==2)
+            SDp4 = <int>(SDp & 3)
+            sDp4 = <int>(sDp & 3)
+            skip_all_v2 = (SDp4 == sDp4) and (SDp4 & 1) == 0
+            if skip_all_v2:
+                st_skip_pair += 1
+                continue
+
+            st_pairs_survived += 1
+
+            # Bisect: premier indice dans sieve > p_v
+            qi_lo = 1
+            qi_hi = sieve_len
+            while qi_lo < qi_hi:
+                qi_mid = (qi_lo + qi_hi) // 2
+                if sv[qi_mid] <= p_v:
+                    qi_lo = qi_mid + 1
+                else:
+                    qi_hi = qi_mid
+
+            # Boucle sur q > p
+            for pi_q in range(qi_lo, sieve_len):
+                q_v = sv[pi_q]
+                if q_v > q_max_cubic:
+                    break
+
+                st_q_tested += 1
+
+                # q copremier à D: bitmask pour petit q
+                if pi_q <= N_SMALL:
+                    if (div_mask >> (pi_q - 1)) & 1:
+                        continue
+                else:
+                    if D % q_v == 0:
+                        continue
+
+                # Filtre per-q: test résidu mod 3, 5 et mod 7
+                if q_kill3_active and q_v % 3 == q_kill3:
+                    st_skip_mod += 1
+                    continue
+                if q_kill5_active and q_v % 5 == q_kill5:
+                    st_skip_mod += 1
+                    continue
+                if q_kill7_active and q_v % 7 == q_kill7:
+                    st_skip_mod += 1
+                    continue
+
+                # SD' * (1+q) > node → break
+                SD1q = SDp * (1 + q_v)
+                if SD1q > node:
+                    break
+
+                num_r = node - SD1q
+                den_r = SDp + q_v * sDp
+
+                # Gros idiv
+                if num_r % den_r != 0:
+                    st_skip_idiv += 1
+                    continue
+
+                r_v = num_r // den_r
+                if r_v <= q_v:
+                    continue
+                if r_v == p_v or D % r_v == 0:
+                    continue
+
+                # r premier? Test rapide: pair ou div par petit premier
+                if r_v % 2 == 0:
+                    continue
+                if r_v > 3 and r_v % 3 == 0:
+                    continue
+                if r_v > 5 and r_v % 5 == 0:
+                    continue
+
+                st_hits += 1
+                k_cubic = D * p_v * q_v * r_v
+                cubic_cands.append((k_cubic, D, p_v, q_v, r_v))
+
+    stats = {
+        'drivers': st_drivers,
+        'p_tested': st_p_tested,
+        'pairs_survived': st_pairs_survived,
+        'q_tested': st_q_tested,
+        'skip_pair': st_skip_pair,
+        'skip_mod': st_skip_mod,
+        'skip_v2': st_skip_v2,
+        'skip_idiv': st_skip_idiv,
+        'hits': st_hits,
+    }
+    return cubic_cands, stats
 
 
 # ============================================================================

@@ -741,6 +741,7 @@ class PerformanceStats:
             print(f"\nFiltrage pré-drivers :")
             print(f"  • Drivers examinés          : {fs['drivers_tested']:>10,}")
             print(f"  • Éliminés (bisect D>node)  : {fs['filtered_bisect']:>10,}")
+            print(f"  • Éliminés (skip_all mod3|7): {fs.get('filtered_skipall', 0):>10,}")
             print(f"  • Éliminés (p_min)          : {fs['filtered_pmin']:>10,}")
             print(f"  • Éliminés (q_max ≤ p_min)  : {fs['filtered_qmax']:>10,}")
             print(f"  • Éliminés (isqrt arrondi)  : {fs['filtered_pmax_lt_pmin']:>10,}")
@@ -751,6 +752,18 @@ class PerformanceStats:
             print(f"  • Quadratic (factorisé)     : {fs['factorized_quadratic']:>10,}")
             print(f"  • Quadratic (fallback)      : {fs['fallback_quadratic']:>10,}")
             print(f"  • TOTAL Quadratic           : {total_quadratic:>10,}")
+            # Stats Cubic
+            cubic_p = fs.get('cubic_p_tested', 0)
+            cubic_q = fs.get('cubic_q_tested', 0)
+            cubic_raw = fs.get('cubic_hits_raw', 0)
+            cubic_sp = fs.get('cubic_skip_pair', 0)
+            cubic_sm = fs.get('cubic_skip_mod', 0)
+            if cubic_p > 0:
+                print(f"  • Cubic p testés            : {cubic_p:>10,}")
+                print(f"  • Cubic paires skip (mod3|7): {cubic_sp:>10,}")
+                print(f"  • Cubic q testés            : {cubic_q:>10,}")
+                print(f"  • Cubic q skip (résidu)     : {cubic_sm:>10,}")
+                print(f"  • Cubic hits (bruts)        : {cubic_raw:>10,}")
         
         print(f"{'='*70}\n")
         self._report_printed = True
@@ -820,6 +833,7 @@ def _ecm_factor(n):
 _filter_stats = {
     'drivers_tested': 0,        # Total drivers examines
     'filtered_bisect': 0,       # Elimines par recherche binaire (D > node)
+    'filtered_skipall': 0,     # Elimines par skip_all mod3|7 (den_q toujours non-divisible)
     'filtered_pmin': 0,         # Elimines par p_min (SD*(1+p_min) > node)
     'filtered_qmax': 0,         # Elimines par q(p_min) <= p_min (sans isqrt)
     'filtered_pmax_lt_pmin': 0, # Elimines car p_max < p_min (arrondi isqrt)
@@ -828,6 +842,11 @@ _filter_stats = {
     'entered_quadratic': 0,     # Entres dans Quadratic (scan lineaire <=300 iters)
     'factorized_quadratic': 0,  # Entres dans Quadratic (approche factorisee)
     'fallback_quadratic': 0,    # Fallback scan lineaire (factorisation echouee)
+    'cubic_p_tested': 0,        # Cubic: premiers p testes
+    'cubic_q_tested': 0,        # Cubic: iterations q (boucle interieure)
+    'cubic_hits_raw': 0,        # Cubic: hits bruts (avant isprime)
+    'cubic_skip_pair': 0,       # Cubic: paires (D,p) skippees (mod3|7 all)
+    'cubic_skip_mod': 0,        # Cubic: q skippees (per-q residue mod3|5|7)
 }
 
 # Petits premiers pour calcul de p_min (3..53 = _SMALL_PRIMES_EXTENDED[1:16])
@@ -1472,6 +1491,7 @@ def worker_search_partial(args):
             # Accumuler les stats Cython
             lf['drivers_tested'] += c_stats.get('drivers_tested', 0)
             lf['filtered_bisect'] += c_stats.get('filtered_bisect', 0)
+            lf['filtered_skipall'] = lf.get('filtered_skipall', 0) + c_stats.get('filtered_skipall', 0)
             lf['filtered_pmin'] += c_stats.get('filtered_pmin', 0)
             lf['filtered_qmax'] += c_stats.get('filtered_qmax', 0)
             lf['filtered_pmax_lt_pmin'] += c_stats.get('filtered_pmax_lt_pmin', 0)
@@ -1495,6 +1515,30 @@ def worker_search_partial(args):
                 if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand):
                     if int(sigma_optimized(k_cand)) - k_cand == node_int:
                         solutions[k_cand] = f"S({D_cand})"
+            
+            # ============================================================
+            # P10: CUBIC — k = D * p * q * r (3 premiers libres)
+            # Trouve des solutions non couvertes par Semi-direct
+            # (D' = D*p à profondeur > max_depth).
+            # ============================================================
+            cubic_cands, cubic_stats = _cython_loops.cubic_loop(
+                node_int, _worker_drv_np, drv_start, drv_end,
+                _worker_sieve_np, len(_SEMI_DIRECT_PRIMES)
+            )
+            lf['cubic_p_tested'] = lf.get('cubic_p_tested', 0) + cubic_stats.get('p_tested', 0)
+            lf['cubic_q_tested'] = lf.get('cubic_q_tested', 0) + cubic_stats.get('q_tested', 0)
+            lf['cubic_hits_raw'] = lf.get('cubic_hits_raw', 0) + cubic_stats.get('hits', 0)
+            lf['cubic_skip_pair'] = lf.get('cubic_skip_pair', 0) + cubic_stats.get('skip_pair', 0)
+            lf['cubic_skip_mod'] = lf.get('cubic_skip_mod', 0) + cubic_stats.get('skip_mod', 0)
+            
+            for k_cand, D_cand, p_cand, q_cand, r_cand in cubic_cands:
+                if k_cand in _pretest_keys:
+                    continue
+                if k_cand in solutions:
+                    continue  # déjà trouvé par Direct ou Semi
+                if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand) and gmpy2.is_prime(r_cand):
+                    if int(sigma_optimized(k_cand)) - k_cand == node_int:
+                        solutions[k_cand] = f"C({D_cand})"
             
             # Quadratic: toujours en Python (rare, > 10^14)
             # Short-circuit: Quadratic ne s'active que quand p_max > SEMI_DIRECT_P_MAX
@@ -1898,6 +1942,42 @@ def worker_search(node):
     return worker_search_partial((node, 0, _worker_n_drivers, True))
 
 
+def worker_cubic_only(node):
+    """
+    Recherche UNIQUEMENT par méthode Cubic (k = D*p*q*r).
+    Utilisé pour le rescan des nœuds déjà explorés afin de trouver
+    les solutions cubiques manquées sans refaire Direct/Semi-direct.
+    """
+    global _worker_n_drivers, _worker_drv_np, _worker_sieve_np
+    node_int = int(node)
+    solutions = {}
+    
+    lf = {'cubic_p_tested': 0, 'cubic_q_tested': 0, 'cubic_hits_raw': 0,
+          'cubic_skip_pair': 0, 'cubic_skip_mod': 0}
+    
+    if not CYTHON_AVAILABLE:
+        return (node_int, solutions, lf)
+    
+    cubic_cands, cubic_stats = _cython_loops.cubic_loop(
+        node_int, _worker_drv_np, 0, _worker_n_drivers,
+        _worker_sieve_np, len(_SEMI_DIRECT_PRIMES)
+    )
+    lf['cubic_p_tested'] += cubic_stats.get('p_tested', 0)
+    lf['cubic_q_tested'] += cubic_stats.get('q_tested', 0)
+    lf['cubic_hits_raw'] += cubic_stats.get('hits', 0)
+    lf['cubic_skip_pair'] += cubic_stats.get('skip_pair', 0)
+    lf['cubic_skip_mod'] += cubic_stats.get('skip_mod', 0)
+    
+    for k_cand, D_cand, p_cand, q_cand, r_cand in cubic_cands:
+        if k_cand in solutions:
+            continue
+        if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand) and gmpy2.is_prime(r_cand):
+            if int(sigma_optimized(k_cand)) - k_cand == node_int:
+                solutions[k_cand] = f"C({D_cand})"
+    
+    return (node_int, solutions, lf)
+
+
 
 # ============================================================================
 # CLASSE PRINCIPALE
@@ -2165,6 +2245,115 @@ class ArbreAliquoteV6:
             _stats.report()
             self.afficher()
     
+    def cubic_rescan(self):
+        """
+        Ré-explore TOUS les nœuds du cache avec la méthode Cubic uniquement.
+        Ne refait PAS Direct/Semi-direct. Ajoute les nouvelles solutions C(D)
+        aux nœuds existants du cache, puis relance un construire normal
+        pour explorer les nouvelles branches découvertes.
+        """
+        import time as _time
+        
+        drivers_array, n_drivers = get_cached_drivers(
+            self.cible_initiale, self.val_max_coche,
+            self.smooth_bound, self.extra_primes,
+            self.max_depth, self.use_compression
+        )
+        
+        # Charger le cache existant
+        raw_cache = self.global_cache.cache or {}
+        if not raw_cache:
+            print("[Cubic Rescan] Cache vide, rien à rescanner.")
+            return
+        
+        # Collecter tous les nœuds pairs du cache (les impairs n'ont jamais de cubiques)
+        all_nodes = []
+        for node_str in raw_cache.keys():
+            try:
+                nv = int(node_str)
+                if nv % 2 == 0:  # Seuls les pairs ont des cubiques
+                    all_nodes.append(nv)
+            except Exception:
+                continue
+        
+        print(f"[Cubic Rescan] {len(all_nodes)} nœuds pairs à rescanner")
+        
+        if not all_nodes:
+            print("[Cubic Rescan] Aucun nœud pair, rien à faire.")
+            return
+        
+        num_workers = max(1, cpu_count() - 2)
+        pool = Pool(
+            num_workers,
+            initializer=init_worker_with_drivers,
+            initargs=((drivers_array, n_drivers),)
+        )
+        
+        new_solutions_total = 0
+        nodes_updated = 0
+        t0 = _time.time()
+        
+        try:
+            # Traiter par batch pour afficher la progression
+            batch_size = max(100, len(all_nodes) // 20)
+            
+            for batch_start in range(0, len(all_nodes), batch_size):
+                batch = all_nodes[batch_start:batch_start + batch_size]
+                batch_new = 0
+                
+                for node_int, solutions, local_fs in pool.imap_unordered(
+                        worker_cubic_only, batch, chunksize=max(1, len(batch) // num_workers)):
+                    
+                    if not solutions:
+                        continue
+                    
+                    # Charger les antécédents existants
+                    existing = self.global_cache.get_antecedents(node_int)
+                    if existing is None:
+                        existing = {}
+                    
+                    # Ajouter seulement les NOUVELLES solutions
+                    added = 0
+                    for k, stype in solutions.items():
+                        k_str = str(k)
+                        if k_str not in existing:
+                            existing[k_str] = stype
+                            added += 1
+                    
+                    if added > 0:
+                        self.global_cache.cache[str(node_int)] = existing
+                        nodes_updated += 1
+                        batch_new += added
+                        new_solutions_total += added
+                
+                elapsed = _time.time() - t0
+                progress = min(batch_start + len(batch), len(all_nodes))
+                print(f"  [{progress}/{len(all_nodes)}] +{batch_new} nouvelles solutions ({elapsed:.1f}s)")
+        
+        finally:
+            pool.close()
+            pool.join()
+        
+        elapsed = _time.time() - t0
+        print(f"\n[Cubic Rescan] Terminé en {elapsed:.1f}s")
+        print(f"  • Nœuds rescannés : {len(all_nodes)}")
+        print(f"  • Nœuds avec nouvelles solutions : {nodes_updated}")
+        print(f"  • Nouvelles solutions cubiques : {new_solutions_total}")
+        
+        if new_solutions_total > 0:
+            # Sauvegarder le cache mis à jour
+            self.global_cache.save()
+            print(f"  • Cache sauvegardé")
+            
+            # Relancer construire en mode reprise pour explorer les nouvelles branches
+            print(f"\n{'='*70}")
+            print(f"  RELANCE EN MODE REPRISE pour explorer les nouvelles branches cubiques")
+            print(f"{'='*70}\n")
+            self.explored.clear()
+            self.construire(reprise_active=True)
+        else:
+            print("  • Aucune nouvelle solution — pas de relance nécessaire.")
+
     def _resume_from_cache(self):
         raw_cache = self.global_cache.cache or {}
         
@@ -2389,6 +2578,8 @@ if __name__ == "__main__":
                         help="Reprendre depuis le cache global")
     parser.add_argument("--allow-empty-node-exploration", action='store_true',
                         help="Permettre la ré-exploration des nœuds vides {{}} (défaut: désactivé)")
+    parser.add_argument("--cubic-rescan", action='store_true',
+                        help="Ré-explorer TOUS les nœuds du cache avec la méthode Cubic uniquement")
     args = parser.parse_args()
     
     n_val = abs(int(args.n))
@@ -2417,6 +2608,7 @@ if __name__ == "__main__":
     print(f"  • Compression : {'OUI' if args.compress else 'NON'}")
     print(f"  • Reprise : {'OUI' if args.resume else 'NON'}")
     print(f"  • Ré-exploration nœuds vides : {'OUI' if args.allow_empty_node_exploration else 'NON'}")
+    print(f"  • Cubic rescan : {'OUI' if args.cubic_rescan else 'NON'}")
     if NUMBA_AVAILABLE:
         print(f"  • Numba : ACTIVÉ (seuil: {NUMBA_THRESHOLD:,})")
     else:
@@ -2433,5 +2625,8 @@ if __name__ == "__main__":
         allow_empty_exploration=args.allow_empty_node_exploration
     )
     app.val_max_coche = args.val_coche
-    app.construire(reprise_active=args.resume)
-    app.construire(reprise_active=args.resume)
+    
+    if args.cubic_rescan:
+        app.cubic_rescan()
+    else:
+        app.construire(reprise_active=args.resume)
