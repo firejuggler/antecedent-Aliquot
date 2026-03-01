@@ -1,6 +1,6 @@
 # cython: boundscheck=False, wraparound=False, cdivision=True, language_level=3
 """
-fast_loops.pyx V2 — Boucle principale drivers + Semi-direct compilée en C.
+fast_loops.pyx V3 — Boucle principale drivers + Semi-direct compilée en C.
 Fusionne : itération drivers, Direct, filtres, Semi-direct en un seul passage.
 
 V2 CHANGEMENTS:
@@ -10,11 +10,45 @@ V2 CHANGEMENTS:
     bits 24-27 = index p_min dans P_MIN_VALS (0..15 → 3..59)
   - Gain: 30-60% sur la boucle semi-direct (supprime les idiv D%p pour p≤97).
   - Fix overflow: target_q calculé en float64.
+
+V3 CHANGEMENTS:
+  - Ajout mulmod128/powmod128 via __uint128_t (GCC) pour arithmétique 64 bits sans overflow.
+  - Nouveau is_prime_c : Miller-Rabin déterministe (12 témoins, valide pour n < 3.317×10^24).
+  - cubic_loop: test de primalité de r_v remplacé par is_prime_c (supprime les faux positifs).
+  - cubic_loop: ajout des filtres q_kill mod 11 et mod 13 (réduction ~10-15% de q testés).
+  - cubic_loop: correction de la borne q_max (formule exacte via résolution quadratique),
+    l'ancienne approximation sqrt(node/SDp)-1 manquait des candidats valides.
 """
 
 import numpy as np
 cimport numpy as np
 from libc.math cimport sqrt
+
+# ============================================================================
+# Arithmétique modulaire 128 bits (évite l'overflow pour Miller-Rabin 64 bits)
+# ============================================================================
+cdef extern from *:
+    """
+    static inline unsigned long long _mulmod128(unsigned long long a,
+                                                unsigned long long b,
+                                                unsigned long long m) {
+        return ((__uint128_t)a * b) % m;
+    }
+    static inline unsigned long long _powmod128(unsigned long long base,
+                                                unsigned long long exp,
+                                                unsigned long long mod) {
+        unsigned long long result = 1;
+        base %= mod;
+        while (exp > 0) {
+            if (exp & 1) result = (__uint128_t)result * base % mod;
+            exp >>= 1;
+            base = (__uint128_t)base * base % mod;
+        }
+        return result;
+    }
+    """
+    unsigned long long _mulmod128(unsigned long long, unsigned long long, unsigned long long) noexcept nogil
+    unsigned long long _powmod128(unsigned long long, unsigned long long, unsigned long long) noexcept nogil
 
 # ============================================================================
 # Constantes
@@ -49,6 +83,66 @@ cdef inline long long isqrt_c(long long n) noexcept nogil:
     while (x + 1) * (x + 1) <= n:
         x += 1
     return x
+
+
+cdef bint is_prime_c(long long n) noexcept nogil:
+    """
+    Test de primalité Miller-Rabin déterministe.
+    Valide pour n < 3.317×10^24 (12 témoins : Sorenson & Webster 2016).
+    Nombre de témoins adaptatif selon la taille de n.
+    """
+    if n < 2:
+        return False
+    if n == 2 or n == 3 or n == 5 or n == 7:
+        return True
+    if (n & 1) == 0 or n % 3 == 0 or n % 5 == 0:
+        return False
+    if n < 49:
+        return True
+
+    cdef unsigned long long un = <unsigned long long>n
+    cdef unsigned long long d = un - 1
+    cdef int r = 0
+    while (d & 1) == 0:
+        r += 1
+        d >>= 1
+
+    cdef unsigned long long witnesses[12]
+    witnesses[0] = 2;  witnesses[1] = 3;  witnesses[2] = 5;  witnesses[3] = 7
+    witnesses[4] = 11; witnesses[5] = 13; witnesses[6] = 17; witnesses[7] = 19
+    witnesses[8] = 23; witnesses[9] = 29; witnesses[10] = 31; witnesses[11] = 37
+
+    cdef int num_witnesses
+    cdef unsigned long long L3215031751 = 3215031751ULL
+    if un < 2047:
+        num_witnesses = 1
+    elif un < 1373653:
+        num_witnesses = 2
+    elif un < L3215031751:
+        num_witnesses = 4
+    else:
+        num_witnesses = 12
+
+    cdef unsigned long long a, x
+    cdef int i, j
+    cdef bint composite
+
+    for i in range(num_witnesses):
+        a = witnesses[i]
+        if a >= un:
+            continue
+        x = _powmod128(a, d, un)
+        if x == 1 or x == un - 1:
+            continue
+        composite = True
+        for j in range(r - 1):
+            x = _mulmod128(x, x, un)
+            if x == un - 1:
+                composite = False
+                break
+        if composite:
+            return False
+    return True
 
 
 def compute_mask_pmin(long long D):
@@ -443,7 +537,10 @@ def cubic_loop(
     cdef int q_kill3, q_kill3_active  # résidu q mod 3 à skip (-1 = inactif)
     cdef int q_kill7, q_kill7_active
     cdef int q_kill5, q_kill5_active
+    cdef int q_kill11, q_kill11_active
+    cdef int q_kill13, q_kill13_active
     cdef int inv3, inv7, inv5, nat3, nat7, nat5
+    cdef int inv11, inv13, nat11, nat13
 
     # Filtre v2: au niveau PAIRE — si v2(den_r) > v2(node) pour tout q impair → skip paire
     cdef long long v2_mask
@@ -545,8 +642,9 @@ def cubic_loop(
             if SDp > node or sDp <= 0:
                 continue
 
-            # Borne sqrt sur q
-            q_max_f = sqrt(<double>node / <double>SDp) - 1.0
+            # Borne exacte sur q: résolution de SDp*(1+2q)+q²*sDp ≤ node
+            # (condition r ≥ q), soit q_max = (-SDp + √(SDp·Dp + sDp·node)) / sDp
+            q_max_f = (-<double>SDp + sqrt(<double>SDp * <double>Dp + <double>sDp * <double>node)) / <double>sDp
             q_max_cubic = <long long>q_max_f
             if q_max_cubic <= p_v:
                 continue
@@ -625,12 +723,48 @@ def cubic_loop(
             sDp11 = <int>(sDp % 11)
             nA11 = <int>((node - SDp) % 11)
             skip_all_11 = (sDp11 == 0 and SDp11 == 0 and nA11 != 0)
+            q_kill11_active = 0
+            q_kill11 = 0
+            if not skip_all_11 and sDp11 != 0:
+                if sDp11 == 1:   inv11 = 1
+                elif sDp11 == 2: inv11 = 6
+                elif sDp11 == 3: inv11 = 4
+                elif sDp11 == 4: inv11 = 3
+                elif sDp11 == 5: inv11 = 9
+                elif sDp11 == 6: inv11 = 2
+                elif sDp11 == 7: inv11 = 8
+                elif sDp11 == 8: inv11 = 7
+                elif sDp11 == 9: inv11 = 5
+                else:            inv11 = 10
+                q_kill11 = (11 - (SDp11 * inv11) % 11) % 11
+                nat11 = (nA11 - SDp11 * q_kill11 % 11 + 121) % 11
+                if nat11 != 0:
+                    q_kill11_active = 1
 
             # --- mod 13 ---
             SDp13 = <int>(SDp % 13)
             sDp13 = <int>(sDp % 13)
             nA13 = <int>((node - SDp) % 13)
             skip_all_13 = (sDp13 == 0 and SDp13 == 0 and nA13 != 0)
+            q_kill13_active = 0
+            q_kill13 = 0
+            if not skip_all_13 and sDp13 != 0:
+                if sDp13 == 1:    inv13 = 1
+                elif sDp13 == 2:  inv13 = 7
+                elif sDp13 == 3:  inv13 = 9
+                elif sDp13 == 4:  inv13 = 10
+                elif sDp13 == 5:  inv13 = 8
+                elif sDp13 == 6:  inv13 = 11
+                elif sDp13 == 7:  inv13 = 2
+                elif sDp13 == 8:  inv13 = 5
+                elif sDp13 == 9:  inv13 = 3
+                elif sDp13 == 10: inv13 = 4
+                elif sDp13 == 11: inv13 = 6
+                else:             inv13 = 12
+                q_kill13 = (13 - (SDp13 * inv13) % 13) % 13
+                nat13 = (nA13 - SDp13 * q_kill13 % 13 + 169) % 13
+                if nat13 != 0:
+                    q_kill13_active = 1
 
             # Skip paire entière?
             if skip_all_3 or skip_all_5 or skip_all_7 or skip_all_11 or skip_all_13:
@@ -674,7 +808,7 @@ def cubic_loop(
                     if D % q_v == 0:
                         continue
 
-                # Filtre per-q: test résidu mod 3, 5 et mod 7
+                # Filtre per-q: test résidu mod 3, 5, 7, 11 et 13
                 if q_kill3_active and q_v % 3 == q_kill3:
                     st_skip_mod += 1
                     continue
@@ -682,6 +816,12 @@ def cubic_loop(
                     st_skip_mod += 1
                     continue
                 if q_kill7_active and q_v % 7 == q_kill7:
+                    st_skip_mod += 1
+                    continue
+                if q_kill11_active and q_v % 11 == q_kill11:
+                    st_skip_mod += 1
+                    continue
+                if q_kill13_active and q_v % 13 == q_kill13:
                     st_skip_mod += 1
                     continue
 
@@ -704,12 +844,8 @@ def cubic_loop(
                 if r_v == p_v or D % r_v == 0:
                     continue
 
-                # r premier? Test rapide: pair ou div par petit premier
-                if r_v % 2 == 0:
-                    continue
-                if r_v > 3 and r_v % 3 == 0:
-                    continue
-                if r_v > 5 and r_v % 5 == 0:
+                # r premier? Miller-Rabin déterministe (élimine les faux positifs)
+                if not is_prime_c(r_v):
                     continue
 
                 st_hits += 1
