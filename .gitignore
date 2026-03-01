@@ -5,6 +5,10 @@ __pycache__/
 *.so
 .Python
 
+# Cython build artifacts
+*.c
+build/
+
 # Backup files
 *.bak
 
