@@ -107,6 +107,12 @@ DIVISORS_CACHE_SIZE = 5000
 MAX_DIVISORS = 8000
 MAX_TARGET_QUADRATIC = 10**18
 QUADRATIC_MAX_ITERATIONS = 1_000_000  # Budget max d'itérations par driver pour Quadratic
+# Seuil quadratique précoce (expérimental).
+# 0 = désactivé (comportement standard : semi-direct jusqu'à 10^7).
+# Exemple : EARLY_QUAD_THRESHOLD=1000000 python3 Arbre_multi_g_optimized.py ...
+# Pour p_max_needed > seuil, on saute le semi-direct et on utilise directement
+# la méthode quadratique (factorisation de target_q + énumération de diviseurs).
+EARLY_QUADRATIC_P_THRESHOLD = int(os.environ.get('EARLY_QUAD_THRESHOLD', '0'))
 GAMMA = 0.57721566490153286
 EXP_GAMMA = math.exp(GAMMA)
 
@@ -726,7 +732,11 @@ class PerformanceStats:
                 print(f"     factorize gmpy2    : {ns['factorize_gmpy2']:>6}")
                 print(f"     factorize ECM used : {ns.get('factorize_ecm', 0):>6}")
                 print(f"     ECM appels/succes  : {ns.get('ecm_calls', 0)}/{ns.get('ecm_success', 0)}")
-            print(f"  P3 Crible semi-direct : {_SEMI_DIRECT_P_MAX:,} ({len(_SEMI_DIRECT_PRIMES):,} premiers)")
+            if _EARLY_QUAD_P_MAX < _SEMI_DIRECT_P_MAX:
+                print(f"  P3 Crible semi-direct : {_SEMI_DIRECT_P_MAX:,} ({len(_SEMI_DIRECT_PRIMES):,} premiers) "
+                      f"[Early-Q: tronqué à {_EARLY_QUAD_P_MAX:,}, {len(_EARLY_QUAD_PRIMES):,} premiers]")
+            else:
+                print(f"  P3 Crible semi-direct : {_SEMI_DIRECT_P_MAX:,} ({len(_SEMI_DIRECT_PRIMES):,} premiers)")
             if CYTHON_AVAILABLE:
                 print(f"  P4 Cython+            : ACTIF (semi_direct, divisors, quadratic_scan, sieve, drivers)")
             else:
@@ -1367,6 +1377,9 @@ def get_cached_drivers(n_cible, val_max_coche, smooth_bound, extra_primes, max_d
 
 _worker_drivers = None
 _worker_n_drivers = 0
+_worker_drv_np = None
+_worker_sieve_np = None
+_worker_early_sieve_np = None
 
 def _sieve_primes(limit):
     # P4: Cython si disponible (5-10x plus rapide)
@@ -1387,8 +1400,19 @@ _sieve_elapsed = time.time() - _sieve_start
 _sieve_method = "Cython" if CYTHON_AVAILABLE else "Python"
 print(f"[P3] OK {len(_SEMI_DIRECT_PRIMES):,} premiers cribles en {_sieve_elapsed:.2f}s (max={_SEMI_DIRECT_P_MAX:,}) [{_sieve_method}]")
 
+# Seuil quadratique précoce : dérive du crible principal
+if 0 < EARLY_QUADRATIC_P_THRESHOLD < _SEMI_DIRECT_P_MAX:
+    _EARLY_QUAD_PRIMES = tuple(p for p in _SEMI_DIRECT_PRIMES if p <= EARLY_QUADRATIC_P_THRESHOLD)
+    _EARLY_QUAD_P_MAX  = _EARLY_QUAD_PRIMES[-1] if _EARLY_QUAD_PRIMES else 2
+    print(f"[Early-Q] Quadratique précoce ACTIVÉ : semi-direct ≤ {_EARLY_QUAD_P_MAX:,} "
+          f"({len(_EARLY_QUAD_PRIMES):,} premiers). "
+          f"Quadratique couvre p > {_EARLY_QUAD_P_MAX:,}.")
+else:
+    _EARLY_QUAD_PRIMES = _SEMI_DIRECT_PRIMES
+    _EARLY_QUAD_P_MAX  = _SEMI_DIRECT_P_MAX
+
 def init_worker_with_drivers(drivers_tuple):
-    global _worker_drivers, _worker_n_drivers, _worker_drv_np, _worker_sieve_np
+    global _worker_drivers, _worker_n_drivers, _worker_drv_np, _worker_sieve_np, _worker_early_sieve_np
     _worker_drivers, _worker_n_drivers = drivers_tuple
     signal.signal(signal.SIGINT, signal.SIG_IGN)
     # P7: Pré-calculer les numpy arrays pour Cython (zero-copy)
@@ -1396,9 +1420,15 @@ def init_worker_with_drivers(drivers_tuple):
         import numpy as np
         _worker_drv_np = np.frombuffer(_worker_drivers, dtype=np.int64)
         _worker_sieve_np = np.array(_SEMI_DIRECT_PRIMES, dtype=np.int64)
+        # Crible tronqué pour le semi-direct quand Early-Q est activé
+        if _EARLY_QUAD_P_MAX < _SEMI_DIRECT_P_MAX:
+            _worker_early_sieve_np = np.array(_EARLY_QUAD_PRIMES, dtype=np.int64)
+        else:
+            _worker_early_sieve_np = _worker_sieve_np
     else:
         _worker_drv_np = None
         _worker_sieve_np = None
+        _worker_early_sieve_np = None
 
 def _get_D_factors_set(D_int):
     """Pre-factorise D pour test coprimality O(1)."""
@@ -1481,11 +1511,15 @@ def worker_search_partial(args):
         # Les candidats retournés sont vérifiés is_prime en Python.
         # ============================================================
         if CYTHON_AVAILABLE:
-            global _worker_drv_np, _worker_sieve_np
-            
+            global _worker_drv_np, _worker_sieve_np, _worker_early_sieve_np
+
+            # Early-Q: passer le crible tronqué pour limiter le semi-direct à _EARLY_QUAD_P_MAX
+            _semi_sieve    = _worker_early_sieve_np
+            _semi_sieve_len = len(_EARLY_QUAD_PRIMES)
+            _semi_p_max    = _EARLY_QUAD_P_MAX
             direct_cands, semi_cands, c_stats = _cython_loops.driver_loop_direct_semi(
                 node_int, _worker_drv_np, drv_start, drv_end,
-                _worker_sieve_np, len(_SEMI_DIRECT_PRIMES), _SEMI_DIRECT_P_MAX
+                _semi_sieve, _semi_sieve_len, _semi_p_max
             )
             
             # Accumuler les stats Cython
@@ -1540,12 +1574,11 @@ def worker_search_partial(args):
                     if int(sigma_optimized(k_cand)) - k_cand == node_int:
                         solutions[k_cand] = f"C({D_cand})"
             
-            # Quadratic: toujours en Python (rare, > 10^14)
-            # Short-circuit: Quadratic ne s'active que quand p_max > SEMI_DIRECT_P_MAX
-            # ce qui requiert target_q assez grand. Pour le plus petit driver D=2 (sD=1),
-            # p_max ≈ sqrt(node) → p_max > 10^7 ssi node > 10^14.
-            # On ne re-scanne les drivers que si node est assez grand.
-            quadratic_threshold = _SEMI_DIRECT_P_MAX * _SEMI_DIRECT_P_MAX  # ~10^14
+            # Quadratic: toujours en Python.
+            # Short-circuit: Quadratic ne s'active que quand p_max > _EARLY_QUAD_P_MAX
+            # (= _SEMI_DIRECT_P_MAX en mode standard, ou seuil abaissé en mode Early-Q).
+            # Pour le plus petit driver D=2 (sD=1), p_max ≈ sqrt(node).
+            quadratic_threshold = _EARLY_QUAD_P_MAX * _EARLY_QUAD_P_MAX
             if node_int > quadratic_threshold:
                 effective_end_q = drv_end
                 if drv[(drv_end - 1) * 4] > node_int:
@@ -1580,18 +1613,18 @@ def worker_search_partial(args):
                         continue
                     sqrt_target_int = int(gmpy2.isqrt(target_q))
                     p_max_needed = (sqrt_target_int - SD_int) // sD
-                    if p_max_needed < p_min or p_max_needed <= _SEMI_DIRECT_P_MAX:
+                    if p_max_needed < p_min or p_max_needed <= _EARLY_QUAD_P_MAX:
                         continue
-                
-                    # Quadratic zone: p > _SEMI_DIRECT_P_MAX
-                    p_start = _SEMI_DIRECT_P_MAX + 1
+
+                    # Quadratic zone: p > _EARLY_QUAD_P_MAX
+                    p_start = _EARLY_QUAD_P_MAX + 1
                     div_min = p_start * sD + SD_int
                     if div_min > sqrt_target_int:
                         continue
                     n_quad_iters = (sqrt_target_int - div_min) // sD + 1
-                    if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
-                        continue
-                
+                    # Le garde n_quad_iters s'applique uniquement au scan linéaire.
+                    # Le chemin factorisé (n_quad_iters > 300) n'est pas limité ici.
+
                     if n_quad_iters > 300:
                         if gmpy2.is_prime(target_q):
                             lf['filtered_tq_prime'] += 1
@@ -1622,16 +1655,20 @@ def worker_search_partial(args):
                                             solutions[k_quad] = f"Q({D_int})"
                         else:
                             lf['fallback_quadratic'] += 1
-                            pq_candidates = _cython_loops.quadratic_scan_fallback(
-                                target_q, div_min, sqrt_target_int, sD, SD_int, D_int
-                            )
-                            for p_v, q_v in pq_candidates:
-                                if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
-                                    k_quad = D_int * p_v * q_v
-                                    if k_quad not in _pretest_keys:
-                                        if int(sigma_optimized(k_quad)) - k_quad == node_int:
-                                            solutions[k_quad] = f"Q({D_int})"
+                            if n_quad_iters <= QUADRATIC_MAX_ITERATIONS:
+                                pq_candidates = _cython_loops.quadratic_scan_fallback(
+                                    target_q, div_min, sqrt_target_int, sD, SD_int, D_int
+                                )
+                                for p_v, q_v in pq_candidates:
+                                    if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
+                                        k_quad = D_int * p_v * q_v
+                                        if k_quad not in _pretest_keys:
+                                            if int(sigma_optimized(k_quad)) - k_quad == node_int:
+                                                solutions[k_quad] = f"Q({D_int})"
                     else:
+                        # Scan linéaire : garder le budget max d'itérations
+                        if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
+                            continue
                         lf['entered_quadratic'] += 1
                         pq_candidates = _cython_loops.quadratic_scan(
                             target_q, div_min, sqrt_target_int, sD, SD_int, D_int
@@ -1642,7 +1679,7 @@ def worker_search_partial(args):
                                 if k_quad not in _pretest_keys:
                                     if int(sigma_optimized(k_quad)) - k_quad == node_int:
                                         solutions[k_quad] = f"Q({D_int})"
-        
+
             else:
                 # ============================================================
                 # FALLBACK PYTHON — boucle originale sans Cython
@@ -1730,19 +1767,21 @@ def worker_search_partial(args):
                         continue
             
                     # ========================================================
-                    # Semi-direct : k = D * p * q (sieve rapide, p ≤ 10^6)
+                    # Semi-direct : k = D * p * q (sieve rapide, p ≤ _EARLY_QUAD_P_MAX)
+                    # En mode Early-Q, le seuil est abaissé ; la plage au-dessus
+                    # sera traitée par la méthode Quadratique (factorisation).
                     # ========================================================
-                    if p_max_needed <= _SEMI_DIRECT_P_MAX:
+                    if p_max_needed <= _EARLY_QUAD_P_MAX:
                         lf['entered_semi_direct'] += 1
-                
+
                         # P3/P4: Pre-factoriser D + Cython si disponible
                         D_factors = _get_D_factors_set(D_int) if p_max_needed > 200 else set()
-                
+
                         if CYTHON_AVAILABLE and p_max_needed > 500:
                             # P4: Cython pour la boucle semi-directe
                             candidates = _cython_loops.semi_direct_search(
                                 node_int, D_int, SD_int, sD, p_max_needed,
-                                _SEMI_DIRECT_PRIMES, D_factors
+                                _EARLY_QUAD_PRIMES, D_factors
                             )
                             for p_v, q_v in candidates:
                                 if gmpy2.is_prime(p_v) and gmpy2.is_prime(q_v):
@@ -1799,22 +1838,27 @@ def worker_search_partial(args):
                         continue
             
                     # Borne inférieure : p_start évite de retester les p
-                    # déjà couverts par Semi-direct
-                    if p_max_needed <= _SEMI_DIRECT_P_MAX:
-                        p_start = _SEMI_DIRECT_P_MAX + 1
+                    # déjà couverts par Semi-direct.
+                    # En mode Early-Q, le semi-direct s'arrête à _EARLY_QUAD_P_MAX,
+                    # donc le quadratique doit couvrir [_EARLY_QUAD_P_MAX+1, p_max_needed]
+                    # — ou la plage complète [p_min, p_max_needed] si p_max > _SEMI_DIRECT_P_MAX.
+                    if p_max_needed <= _EARLY_QUAD_P_MAX:
+                        # Déjà entièrement couvert par semi-direct → skip
+                        p_start = _EARLY_QUAD_P_MAX + 1
                     else:
+                        # p_max_needed > _EARLY_QUAD_P_MAX :
+                        # En mode standard _EARLY_QUAD_P_MAX == _SEMI_DIRECT_P_MAX,
+                        # p_start = p_min couvre [p_min, p_max_needed].
+                        # En mode Early-Q (seuil abaissé), idem : on couvre tout.
                         p_start = p_min
                     div_min = p_start * sD + SD_int
-            
+
                     # Rien à chercher si div_min > √target_q
                     if div_min > sqrt_target_int:
                         continue
-            
+
                     n_quad_iters = (sqrt_target_int - div_min) // sD + 1
-            
-                    if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
-                        continue
-            
+
                     # ============================================================
                     # STRATÉGIE ADAPTATIVE :
                     # - Peu d'itérations (≤ 300) → scan linéaire direct.
@@ -1861,8 +1905,11 @@ def worker_search_partial(args):
                         else:
                             # Factorisation échouée → fallback scan linéaire
                             lf['fallback_quadratic'] += 1
+                            # Scan linéaire trop long ? Skip.
+                            if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
+                                pass
                             # P4: Cython pour le fallback scan (3-5x plus rapide)
-                            if CYTHON_AVAILABLE:
+                            elif CYTHON_AVAILABLE:
                                 pq_candidates = _cython_loops.quadratic_scan_fallback(
                                     target_q, div_min, sqrt_target_int, sD, SD_int, D_int
                                 )
@@ -1898,6 +1945,8 @@ def worker_search_partial(args):
                         # --- SCAN LINÉAIRE DIRECT (≤ 300 itérations) ---
                         # Pas de test de primalité : le scan coûte ≤ 15µs,
                         # moins cher que is_prime (~5µs) dans 95% des cas.
+                        if n_quad_iters > QUADRATIC_MAX_ITERATIONS:
+                            continue
                         lf['entered_quadratic'] += 1
                         # P4: Cython pour le scan linéaire (3-5x plus rapide)
                         if CYTHON_AVAILABLE:
@@ -2580,7 +2629,23 @@ if __name__ == "__main__":
                         help="Permettre la ré-exploration des nœuds vides {{}} (défaut: désactivé)")
     parser.add_argument("--cubic-rescan", action='store_true',
                         help="Ré-explorer TOUS les nœuds du cache avec la méthode Cubic uniquement")
+    parser.add_argument("--early-quadratic-threshold", type=int, default=0,
+                        help="Seuil p_max pour semi-direct (défaut: 0 = désactivé, utilise EARLY_QUAD_THRESHOLD). "
+                             "Ex: 1000000 → semi-direct ≤ 10^6, quadratique pour p > 10^6.")
     args = parser.parse_args()
+
+    # La variable d'environnement prime sur le flag CLI (si elle est déjà définie)
+    if args.early_quadratic_threshold > 0 and EARLY_QUADRATIC_P_THRESHOLD == 0:
+        import importlib, sys as _sys
+        # Réappliquer le seuil : on met à jour les globaux dérivés
+        # (le crible principal est déjà calculé, on peut dériver maintenant)
+        global EARLY_QUADRATIC_P_THRESHOLD, _EARLY_QUAD_PRIMES, _EARLY_QUAD_P_MAX
+        EARLY_QUADRATIC_P_THRESHOLD = args.early_quadratic_threshold
+        if 0 < EARLY_QUADRATIC_P_THRESHOLD < _SEMI_DIRECT_P_MAX:
+            _EARLY_QUAD_PRIMES = tuple(p for p in _SEMI_DIRECT_PRIMES if p <= EARLY_QUADRATIC_P_THRESHOLD)
+            _EARLY_QUAD_P_MAX  = _EARLY_QUAD_PRIMES[-1] if _EARLY_QUAD_PRIMES else 2
+            print(f"[Early-Q] Quadratique précoce ACTIVÉ (via CLI) : semi-direct ≤ {_EARLY_QUAD_P_MAX:,} "
+                  f"({len(_EARLY_QUAD_PRIMES):,} premiers).")
     
     n_val = abs(int(args.n))
     log_n = math.log10(n_val + 1)
@@ -2609,6 +2674,10 @@ if __name__ == "__main__":
     print(f"  • Reprise : {'OUI' if args.resume else 'NON'}")
     print(f"  • Ré-exploration nœuds vides : {'OUI' if args.allow_empty_node_exploration else 'NON'}")
     print(f"  • Cubic rescan : {'OUI' if args.cubic_rescan else 'NON'}")
+    if _EARLY_QUAD_P_MAX < _SEMI_DIRECT_P_MAX:
+        print(f"  • Early-Q seuil : p ≤ {_EARLY_QUAD_P_MAX:,} ({len(_EARLY_QUAD_PRIMES):,} premiers) — quadratique pour p > {_EARLY_QUAD_P_MAX:,}")
+    else:
+        print(f"  • Early-Q seuil : désactivé (semi-direct jusqu'à {_SEMI_DIRECT_P_MAX:,})")
     if NUMBA_AVAILABLE:
         print(f"  • Numba : ACTIVÉ (seuil: {NUMBA_THRESHOLD:,})")
     else:
