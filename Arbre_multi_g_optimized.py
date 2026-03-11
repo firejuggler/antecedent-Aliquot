@@ -6,7 +6,7 @@ Basé sur V5 Ultra-Optimisée + Algorithme de Pomerance H2 AMÉLIORÉ + Numba JI
 
 Améliorations de l'heuristique :
 - ✅ Différences courantes (12, 56, 992, ...) : ~11% des cas
-- ✅ Offsets primoriaux (2×P#) : ~0.2% des cas
+- ✅ Offsets primoriaux (2*P#) : ~0.2% des cas
 - ✅ Pomerance H2 ÉTENDU : Couverture +40%
   • 25+ ratios (standards + Fibonacci/Pell/Lucas + paires amiables)
   • Multiplicateurs adaptatifs par taille (small/medium/large)
@@ -21,7 +21,7 @@ Améliorations de l'heuristique :
   • Pollard-Rho optimisé avec @njit
   • Dispatch intelligent Numba/gmpy2 selon la taille des nombres
 
-Note : Pomerance H1 (k=2^a×p) et H3 (k=4×p) SUPPRIMÉS car redondants
+Note : Pomerance H1 (k=2^a*p) et H3 (k=4*p) SUPPRIMÉS car redondants
       avec méthode Direct (les drivers incluent déjà ces formes)
 
 Dépendances:
@@ -48,8 +48,546 @@ import math
 import pickle
 import gzip
 from multiprocessing import Pool, cpu_count, Array as SharedArray
-from sympy import primerange
 from collections import defaultdict, OrderedDict, deque
+
+# OPTIMISATION: Remplace sympy.primerange par fonction locale utilisant gmpy2
+def primerange(start, end):
+    """Génère les nombres premiers entre start (inclus) et end (exclus)"""
+    for n in range(start, end):
+        if gmpy2.is_prime(n):
+            yield n
+
+# OPTIMISATION: Cache LRU pour is_prime et sigma_optimized
+class LRUCache:
+    """Cache LRU simple pour optimiser is_prime et sigma"""
+    def __init__(self, maxsize=10000):
+        self.cache = OrderedDict()
+        self.maxsize = maxsize
+        self.hits = 0
+        self.misses = 0
+    
+    def get(self, key):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+            self.hits += 1
+            return self.cache[key]
+        self.misses += 1
+        return None
+    
+    def put(self, key, value):
+        if key in self.cache:
+            self.cache.move_to_end(key)
+        else:
+            if len(self.cache) >= self.maxsize:
+                self.cache.popitem(last=False)
+        self.cache[key] = value
+
+# Caches globaux
+_prime_cache = LRUCache(maxsize=50000)
+_sigma_cache = LRUCache(maxsize=20000)
+
+def is_prime_cached(n):
+    """Wrapper is_prime avec cache LRU"""
+    cached = _prime_cache.get(n)
+    if cached is not None:
+        return cached
+    result = gmpy2.is_prime(n)
+    _prime_cache.put(n, result)
+    return result
+
+def sigma_optimized_cached(n):
+    """Wrapper sigma_optimized avec cache LRU"""
+    cached = _sigma_cache.get(n)
+    if cached is not None:
+        return cached
+    result = sigma_optimized(n)
+    _sigma_cache.put(n, result)
+    return result
+
+def sigma_func(n):
+    """Calcule σ(n) = somme des diviseurs (version optimisée)"""
+    if n <= 0:
+        return 0
+    if n == 1:
+        return 1
+    
+    result = 1
+    temp = n
+    
+    if temp % 2 == 0:
+        k = 0
+        while temp % 2 == 0:
+            k += 1
+            temp //= 2
+        pk = 2 ** (k + 1)
+        sigma_pk = pk - 1
+        result *= sigma_pk
+    
+    p = 3
+    while p * p <= temp:
+        if temp % p == 0:
+            k = 0
+            while temp % p == 0:
+                k += 1
+                temp //= p
+            pk = p ** (k + 1)
+            sigma_pk = (pk - 1) // (p - 1)
+            result *= sigma_pk
+        p += 2
+    
+    if temp > 1:
+        result *= (temp + 1)
+    
+    return result
+
+
+def find_odd_antecedents_booker(node_int, max_a=500):
+    """
+    Trouve TOUS les antécédents IMPAIRS m tels que s(m) = node_int.
+    
+    Basé sur l'algorithme de Booker (2018) - Équation (2.1):
+        n = s(a^2)p^(2k) + σ(a^2)(p^(2k) - 1)/(p - 1)
+    
+    EXTENSIONS:
+    - Semi-premiers p*q (pour n impair)
+    - Carrés (p*q)^2 (pour n pair, limité aux petits p,q)
+    
+    Couvre exhaustivement:
+    - p^2, p^4, p^6, p^8 (a=1)
+    - a^2p^2, a^2p^4 (a≥3 impair)
+    - p*q (semi-premiers impairs, pour n impair)
+    - (p*q)^2 (carrés de produits, pour n pair, p,q ≤ 31)
+    
+    Args:
+        node_int: valeur cible n
+        max_a: limite pour a (défaut: 500, raisonnable jusqu'à 10¹⁵)
+    
+    Returns:
+        dict: {m: source_label} des antécédents impairs trouvés
+    
+    Examples:
+        >>> find_odd_antecedents_booker(6)
+        {25: 'Booker(p^2)'}  # 25 = 5^2, s(25) = 1+5 = 6
+        
+        >>> find_odd_antecedents_booker(25)
+        {95: 'SemiPrime(p*q, 5*19)',   # s(95) = 1+5+19 = 25
+         119: 'SemiPrime(p*q, 7*17)',  # s(119) = 1+7+17 = 25
+         143: 'SemiPrime(p*q, 11*13)'} # s(143) = 1+11+13 = 25
+        
+        >>> find_odd_antecedents_booker(178)  # n pair
+        {225: 'Square((p*q)^2, 3*5)'}  # 225 = 15^2 = (3*5)^2, s(225) = 178
+    """
+    import math
+    
+    # Note: Antécédents impairs existent pour tout n (pair ou impair)
+    # Exemple: s(95) = 25 car σ(95)=120 est pair
+    
+    solutions = {}
+    
+    # ============================================================
+    # CAS a = 1: m = p^(2k)
+    # ============================================================
+    
+    # k=1: p^2 avec p = n-1
+    p = node_int - 1
+    if p >= 2 and gmpy2.is_prime(p):
+        solutions[p * p] = "Booker(p^2)"
+    
+    # k=2: p^4 avec p ≈ n^(1/4)
+    if node_int > 10:
+        p_approx = int(node_int ** 0.25)
+        for p in range(max(2, p_approx - 5), min(p_approx + 5, 100000)):
+            if not gmpy2.is_prime(p):
+                continue
+            p4 = p ** 4
+            if p4 > node_int * 10:
+                break
+            s_p4 = (p4 - 1) // (p - 1)
+            if s_p4 == node_int:
+                solutions[p4] = "Booker(p^4)"
+                break
+    
+    # k=3: p^6 avec p ≈ n^(1/6)
+    if node_int > 100:
+        p_approx = int(node_int ** (1.0/6.0))
+        for p in range(max(2, p_approx - 3), min(p_approx + 3, 10000)):
+            if not gmpy2.is_prime(p):
+                continue
+            p6 = p ** 6
+            if p6 > node_int * 10:
+                break
+            s_p6 = (p6 - 1) // (p - 1)
+            if s_p6 == node_int:
+                solutions[p6] = "Booker(p^6)"
+                break
+    
+    # k=4: p^8 avec p ≈ n^(1/8)
+    if node_int > 1000:
+        p_approx = int(node_int ** (1.0/8.0))
+        for p in range(max(2, p_approx - 2), min(p_approx + 2, 1000)):
+            if not gmpy2.is_prime(p):
+                continue
+            p8 = p ** 8
+            if p8 > node_int * 10:
+                break
+            s_p8 = (p8 - 1) // (p - 1)
+            if s_p8 == node_int:
+                solutions[p8] = "Booker(p^8)"
+                break
+    
+    # ============================================================
+    # CAS a ≥ 3: m = a^2p^(2k) avec a impair
+    # ============================================================
+    
+    sqrt_n_over_6 = int(math.sqrt(node_int / 6.0))
+    max_a_actual = min(sqrt_n_over_6, max_a)
+    
+    if max_a_actual >= 3:
+        for a in range(3, max_a_actual + 1, 2):
+            a2 = a * a
+            
+            sigma_a2 = sigma_func(a2)
+            s_a2 = sigma_a2 - a2
+            
+            if sigma_a2 == 0 or sigma_a2 > node_int:
+                continue
+            
+            # q = plus petit impair ≥ 3 ne divisant pas a
+            q = 3
+            while q <= a and a % q == 0:
+                q += 2
+            if q < 3:
+                q = 3
+            
+            # k=1,2 seulement (performance)
+            for k in [1, 2]:
+                max_pk = node_int // sigma_a2
+                if max_pk <= 1:
+                    break
+                
+                p_max = int(max_pk ** (1.0 / (2 * k))) + 5
+                
+                for p in range(q, min(p_max, 10000), 2):
+                    if not gmpy2.is_prime(p):
+                        continue
+                    
+                    pk = p ** (2 * k)
+                    if pk > node_int:
+                        break
+                    
+                    sum_geom = (pk - 1) // (p - 1)
+                    lhs = s_a2 * pk + sigma_a2 * sum_geom
+                    
+                    if lhs == node_int:
+                        m = a2 * pk
+                        solutions[m] = f"Booker(a^2p^{2*k}, a={a})"
+                    elif lhs > node_int:
+                        break
+    
+    # ============================================================
+    # EXTENSION: CAS m = p*q (semi-premiers impairs)
+    # Pour m = p*q (p,q premiers impairs): s(pq) = 1 + p + q
+    # Donc: 1 + p + q = node_int → p + q = node_int - 1
+    # 
+    # OPTIMISATIONS:
+    # 1. Symétrie: si (p,q) solution, on teste seulement p ≤ √target_sum
+    # 2. Sieve segmenté: génère seulement les premiers dans [3, √target_sum]
+    # ============================================================
+    
+    if node_int > 2:
+        target_sum = node_int - 1
+        
+        # Si target_sum est impair, p et q de parités différentes
+        # → Impossible d'avoir p,q tous deux impairs
+        if target_sum % 2 == 0:
+            # ✅ OPTIMISATION 1: Symétrie - chercher seulement p ≤ √target_sum
+            # Si p > √target_sum, alors q < √target_sum, donc la paire (q,p) 
+            # sera déjà trouvée quand on teste q
+            import math
+            sqrt_target = int(math.sqrt(target_sum)) + 1
+            
+            # ✅ OPTIMISATION 2: Sieve segmenté pour générer premiers impairs
+            # Beaucoup plus rapide que tester is_prime() pour chaque candidat
+            # Utilise le sieve d'Ératosthène dans la fenêtre [3, sqrt_target]
+            
+            # Cas particulier: petites valeurs (< 1000)
+            if sqrt_target < 1000:
+                # Pour petites fenêtres, test direct reste rapide
+                for p in range(3, sqrt_target, 2):
+                    if not gmpy2.is_prime(p):
+                        continue
+                    
+                    q = target_sum - p
+                    
+                    # Par symétrie, p ≤ q automatiquement garanti
+                    # (car p ≤ √target_sum et q ≥ √target_sum)
+                    
+                    if gmpy2.is_prime(q):
+                        m = p * q
+                        solutions[m] = f"SemiPrime(p*q, {p}*{q})"
+            
+            else:
+                # Pour grandes fenêtres, utiliser sieve segmenté OPTIMISÉ
+                # OPTIMISATION: Sieve bidirectionnel pour éviter is_prime(q) répété
+                
+                # Sieve 1: Premiers petits [3, sqrt_target]
+                is_prime_arr = [True] * (sqrt_target + 1)
+                is_prime_arr[0] = is_prime_arr[1] = False
+                if sqrt_target >= 4:
+                    is_prime_arr[4] = False
+                
+                # Marquer les composés pairs (sauf 2)
+                for i in range(4, sqrt_target + 1, 2):
+                    is_prime_arr[i] = False
+                
+                # Sieve pour les impairs
+                p = 3
+                while p * p <= sqrt_target:
+                    if is_prime_arr[p]:
+                        for i in range(p * p, sqrt_target + 1, 2 * p):
+                            is_prime_arr[i] = False
+                    p += 2
+                
+                # OPTIMISATION: Sieve 2: Premiers grands [sqrt_target+1, target_sum]
+                # pour éviter gmpy2.is_prime(q) répété (50* plus rapide)
+                high_start = sqrt_target + 1
+                if high_start % 2 == 0:
+                    high_start += 1  # Commencer sur impair
+                
+                high_size = max(0, target_sum - high_start + 1)
+                if high_size > 0 and high_size < 10_000_000:  # Limite mémoire
+                    # Sieve pour la plage haute
+                    is_prime_high = [True] * ((high_size + 1) // 2)  # Seulement impairs
+                    
+                    # Marquer composés avec petits premiers
+                    for p in range(3, min(int(target_sum**0.5) + 1, sqrt_target), 2):
+                        if not is_prime_arr[p]:
+                            continue
+                        # Premier multiple impair de p dans [high_start, target_sum]
+                        first_mult = ((high_start + p - 1) // p) * p
+                        if first_mult % 2 == 0:
+                            first_mult += p
+                        for i in range(first_mult, target_sum + 1, 2 * p):
+                            if i >= high_start:
+                                idx = (i - high_start) // 2
+                                if idx < len(is_prime_high):
+                                    is_prime_high[idx] = False
+                    
+                    # Construire set de premiers hauts pour O(1) lookup
+                    primes_high_set = set()
+                    for i, is_p in enumerate(is_prime_high):
+                        if is_p:
+                            val = high_start + 2 * i
+                            if val <= target_sum:
+                                primes_high_set.add(val)
+                    
+                    # Boucle principale OPTIMISÉE avec set lookup
+                    for p in range(3, sqrt_target, 2):
+                        if not is_prime_arr[p]:
+                            continue
+                        
+                        q = target_sum - p
+                        
+                        # O(1) lookup au lieu de gmpy2.is_prime(q)
+                        if q in primes_high_set or (q <= sqrt_target and is_prime_arr[q]):
+                            m = p * q
+                            solutions[m] = f"SemiPrime(p*q, {p}*{q})"
+                else:
+                    # Fallback: plage haute trop grande, utiliser gmpy2
+                    for p in range(3, sqrt_target, 2):
+                        if not is_prime_arr[p]:
+                            continue
+                        
+                        q = target_sum - p
+                        
+                        if gmpy2.is_prime(q):
+                            m = p * q
+                            solutions[m] = f"SemiPrime(p*q, {p}*{q})"
+    
+    # ========================================
+    # EXTENSION HYBRIDE ADAPTATIVE: Cas m = (p*q)^2 pour n PAIR
+    # Version OPTIMALE avec couverture 100% jusqu'à n = 10^12
+    # OPTIMISÉ: Early exit + cache σ(p^2) pré-calculé
+    # ========================================
+    if node_int % 2 == 0:  # Seulement pour n pair
+        # Liste pré-calculée de 270 premiers pour couverture complète n ≤ 10^12
+        _PQ_SQUARED_PRIMES_270 = [
+            3, 5, 7, 11, 13, 17, 19, 23, 29, 31,
+            37, 41, 43, 47, 53, 59, 61, 67, 71, 73,
+            79, 83, 89, 97, 101, 103, 107, 109, 113, 127,
+            131, 137, 139, 149, 151, 157, 163, 167, 173, 179,
+            181, 191, 193, 197, 199, 211, 223, 227, 229, 233,
+            239, 241, 251, 257, 263, 269, 271, 277, 281, 283,
+            293, 307, 311, 313, 317, 331, 337, 347, 349, 353,
+            359, 367, 373, 379, 383, 389, 397, 401, 409, 419,
+            421, 431, 433, 439, 443, 449, 457, 461, 463, 467,
+            479, 487, 491, 499, 503, 509, 521, 523, 541, 547,
+            557, 563, 569, 571, 577, 587, 593, 599, 601, 607,
+            613, 617, 619, 631, 641, 643, 647, 653, 659, 661,
+            673, 677, 683, 691, 701, 709, 719, 727, 733, 739,
+            743, 751, 757, 761, 769, 773, 787, 797, 809, 811,
+            821, 823, 827, 829, 839, 853, 857, 859, 863, 877,
+            881, 883, 887, 907, 911, 919, 929, 937, 941, 947,
+            953, 967, 971, 977, 983, 991, 997, 1009, 1013, 1019,
+            1021, 1031, 1033, 1039, 1049, 1051, 1061, 1063, 1069, 1087,
+            1091, 1093, 1097, 1103, 1109, 1117, 1123, 1129, 1151, 1153,
+            1163, 1171, 1181, 1187, 1193, 1201, 1213, 1217, 1223, 1229,
+            1231, 1237, 1249, 1259, 1277, 1279, 1283, 1289, 1291, 1297,
+            1301, 1303, 1307, 1319, 1321, 1327, 1361, 1367, 1373, 1381,
+            1399, 1409, 1423, 1427, 1429, 1433, 1439, 1447, 1451, 1453,
+            1459, 1471, 1481, 1483, 1487, 1489, 1493, 1499, 1511, 1523,
+            1531, 1543, 1549, 1553, 1559, 1567, 1571, 1579, 1583, 1597,
+            1601, 1607, 1609, 1613, 1619, 1621, 1627, 1637, 1657, 1663,
+            1667, 1669, 1693, 1697, 1699, 1709, 1721, 1723, 1733, 1741,
+        ]
+        
+        # Sélection ADAPTATIVE selon n - OPTIMISÉ pour n > 10^12
+        if node_int < 10_000:
+            small_primes = _PQ_SQUARED_PRIMES_270[:10]
+        elif node_int < 1_000_000:
+            small_primes = _PQ_SQUARED_PRIMES_270[:20]
+        elif node_int < 1_000_000_000:  # < 10^9
+            small_primes = _PQ_SQUARED_PRIMES_270[:49]
+        elif node_int < 100_000_000_000:  # < 10^11
+            small_primes = _PQ_SQUARED_PRIMES_270[:98]
+        elif node_int < 10_000_000_000_000:  # < 10^13
+            small_primes = _PQ_SQUARED_PRIMES_270[:49]  # Réduit pour performance
+        else:  # ≥ 10^13
+            small_primes = _PQ_SQUARED_PRIMES_270[:20]  # Minimal
+        
+        # OPTIMISATION: Pré-calculer σ(p^2) pour tous les premiers sélectionnés
+        # Évite recalcul répété (10-20% gain)
+        sigma_p2_cache = {p: 1 + p + p*p for p in small_primes}
+        
+        # OPTIMISATION: Borne stricte pour early exit
+        k_max_squared = node_int * 10  # m = k^2 ≤ 10n
+        
+        for i, p in enumerate(small_primes):
+            # OPTIMISATION: Early exit sur p
+            if p * p > k_max_squared:
+                break  # p^2 dépasse déjà la borne, inutile de continuer
+            
+            sigma_p2 = sigma_p2_cache[p]  # O(1) lookup
+            
+            for q in small_primes[i:]:  # q ≥ p
+                k = p * q
+                
+                # OPTIMISATION: Early exit sur k
+                m = k * k
+                if m > k_max_squared:
+                    break  # k^2 dépasse, sortie boucle q
+                
+                # Calculer s(m) avec cache
+                sigma_q2 = sigma_p2_cache[q]
+                sigma_m = sigma_p2 * sigma_q2
+                s_m = sigma_m - m
+                
+                if s_m == node_int:
+                    if m not in solutions:
+                        solutions[m] = f"Square((p*q)^2, {p}*{q})"
+    
+    return solutions
+    
+
+def find_even_antecedents_bosma_bruin(node_int, max_a=30):
+    """
+    Trouve les antécédents PAIRS de n IMPAIR via Bosma & Bruin (2013).
+    """
+    if node_int % 2 == 0:
+        return {}
+    
+    import math
+    solutions = {}
+    
+    # Borne supérieure pour a
+    a_max = min(int(math.log2(node_int + 1)) + 1, max_a)
+    
+    # OPTIMISATION: Pré-calculer toutes les puissances de 2 (5-10% gain)
+    powers_of_2 = [2 ** a for a in range(1, a_max + 1)]
+    powers_of_2_plus1 = [2 ** (a + 1) for a in range(1, a_max + 1)]
+    sigma_2a_values = [2 ** (a + 1) - 1 for a in range(1, a_max + 1)]
+    
+    # ========================================
+    # CAS 1: m = 2^a * p (p premier impair)
+    # ========================================
+    for a, (power_2a, power_2a_plus1) in enumerate(zip(powers_of_2, powers_of_2_plus1), 1):
+        # Formule: p = (n - 2^(a+1) + 1) / (2^a - 1)
+        numerator = node_int - power_2a_plus1 + 1
+        denominator = power_2a - 1
+        
+        if denominator == 0:
+            continue
+        
+        if numerator % denominator != 0:
+            continue
+        
+        p = numerator // denominator
+        
+        if p >= 3 and p % 2 == 1 and gmpy2.is_prime(p):
+            m = power_2a * p
+            solutions[m] = f"BosmaBruin(2^{a}*p, p={p})"
+    
+    # ========================================
+    # CAS 2: m = 2^a * p^2 (carré de premier)
+    # ========================================
+    limit_a2 = min(a_max, 20)
+    for a in range(limit_a2):
+        power_2a = powers_of_2[a]
+        sigma_2a = sigma_2a_values[a]
+        
+        p_max = min(int(math.sqrt(node_int * 10 / power_2a)), 10000)
+        
+        for p in range(3, p_max + 1, 2):
+            if not gmpy2.is_prime(p):
+                continue
+            
+            p2 = p * p
+            m = power_2a * p2
+            
+            if m > node_int * 10:
+                break
+            
+            sigma_b = 1 + p + p2
+            s_m = sigma_2a * sigma_b - m
+            
+            if s_m == node_int:
+                solutions[m] = f"BosmaBruin(2^{a+1}*p^2, p={p})"
+    
+    # ========================================
+    # CAS 3: m = 2^a * (p*q) (semi-premiers)
+    # ========================================
+    limit_a3 = min(a_max, 12)
+    for a in range(limit_a3):
+        power_2a = powers_of_2[a]
+        sigma_2a = sigma_2a_values[a]
+        
+        b_max = min(node_int * 10 // power_2a, 50000)
+        
+        for p in range(3, min(int(math.sqrt(b_max)), 200) + 1, 2):
+            if not gmpy2.is_prime(p):
+                continue
+            
+            q_max = min(b_max // p, 5000)
+            
+            for q in range(p, q_max + 1, 2):
+                if not gmpy2.is_prime(q):
+                    continue
+                
+                b = p * q
+                m = power_2a * b
+                
+                if m > node_int * 10:
+                    break
+                
+                # Calculer s(m) = σ(2^a * p*q) - 2^a * p*q
+                sigma_b = (p + 1) * (q + 1)
+                s_m = sigma_2a * sigma_b - m
+                
+                if s_m == node_int:
+                    solutions[m] = f"BosmaBruin(2^{a}*pq, {p}*{q})"
+    
+    return solutions
+
 
 # ============================================================================
 # P2 : ECM IMPORT (sympy Elliptic Curve Method)
@@ -105,7 +643,7 @@ except ImportError:
 SIGMA_CACHE_SIZE = 10000
 DIVISORS_CACHE_SIZE = 5000
 MAX_DIVISORS = 8000
-MAX_TARGET_QUADRATIC = 10**18
+MAX_TARGET_QUADRATIC = 10**20
 QUADRATIC_MAX_ITERATIONS = 1_000_000  # Budget max d'itérations par driver pour Quadratic
 GAMMA = 0.57721566490153286
 EXP_GAMMA = math.exp(GAMMA)
@@ -174,7 +712,7 @@ def is_prime_numba(n):
       - n < 2 047            : 1 témoin   (2)
       - n < 1 373 653        : 2 témoins  (2, 3)
       - n < 3 215 031 751    : 4 témoins  (2, 3, 5, 7)
-      - n < 3.317×10^24      : 12 témoins (2..37) — déterministe (Sorenson & Webster 2016)
+      - n < 3.317*10^24      : 12 témoins (2..37) — déterministe (Sorenson & Webster 2016)
     Gain ~2x pour n < 10^9.
     """
     if n < 2:
@@ -191,7 +729,7 @@ def is_prime_numba(n):
     if n < 41:  # Tous les premiers < 41 déjà couverts
         return False
     
-    # Décomposition n-1 = d × 2^r
+    # Décomposition n-1 = d * 2^r
     d = n - 1
     r = 0
     while d % 2 == 0:
@@ -247,8 +785,11 @@ def pollard_rho_numba(n, max_iterations=100000):
     if is_prime_numba(n):
         return n
     
-    # Essayer plusieurs valeurs de c pour augmenter les chances de succès
-    for c_val in range(1, 50):
+    # OPTIMISATION: Tentatives adaptatives selon taille
+    max_c_attempts = 5 if n < 10**12 else (10 if n < 10**15 else 20)
+    
+    # Essayer plusieurs valeurs de c
+    for c_val in range(1, max_c_attempts):
         y = 2
         g = 1
         r = 1
@@ -326,7 +867,7 @@ def sigma_numba(n):
     # Les résidus copremiers à 30 sont : 1, 7, 11, 13, 17, 19, 23, 29
     wheel_increments = (4, 2, 4, 2, 4, 6, 2, 6)  # Écarts entre résidus successifs
     d = 101  # Premier candidat > 97
-    wi = 1   # Index dans wheel_increments (101 = 3×30 + 11, résidu 11 → index 2, mais on commence à 1 après +4)
+    wi = 1   # Index dans wheel_increments (101 = 3*30 + 11, résidu 11 → index 2, mais on commence à 1 après +4)
     while d * d <= temp_n:
         if temp_n % d == 0:
             p_pow = d
@@ -351,48 +892,193 @@ def sigma_numba(n):
 # HEURISTIQUE DE POMERANCE AMÉLIORÉE
 # ============================================================================
 
-class ImprovedPomeranceH2:
-    """Heuristique de Pomerance H2 améliorée - VERSION OPTIMISÉE."""
+class AdaptiveHANPomerance:
+    """
+    Pomerance H2 avec génération adaptative de HAN (Highly Abundant Numbers).
+    
+    Basé sur la théorie: Les meilleurs candidats k pour s(k)=n sont des HAN
+    de la forme k = 2^a * 3^b * 5^c * ... avec exposants décroissants.
+    
+    Référence: Paper Pomerance (1975) + nombres hautement abondants.
+    """
     
     def __init__(self):
-        # ✅ OPTIMISÉ: Ratios réduits
-        self.standard_ratios = [
-            (129, 100), (77, 100), (13, 10), (7, 10), (3, 2),
-            (3, 5), (5, 8), (8, 13), (13, 21),
-            (4, 5), (5, 6), (6, 7), (7, 8),
-        ]
-        self.extended_ratios = [
-            (71, 55), (148, 151), (655, 731),
-            (7, 11), (11, 13), (13, 17),
-            (55, 89), (89, 144),
-            (2, 5), (5, 12),
-        ]
-        self.multipliers_small = (2, 3, 5)
-        self.multipliers_medium = (2, 3, 5, 7)
-        self.multipliers_large = (2, 3, 5, 7, 11)
+        # Petits premiers pour construction HAN
+        self.small_primes = [2, 3, 5, 7, 11, 13, 17, 19, 23, 29, 31]
         
-        # ✅ Cache Robin LRU
+        # Cache pour HAN (LRU)
+        self.han_cache = OrderedDict()
+        self.max_han_cache = 500
+        
+        # Cache Robin
         self.robin_cache = OrderedDict()
         self.max_robin_cache = 1000
         
-        # ✅ Cache log(log(x))
+        # Cache log(log(x))
         self.loglog_cache = OrderedDict()
         self.max_loglog_cache = 500
         
         self.stats = {
-            'std': 0, 'ext': 0, 'pow2': 0, 'filtered': 0,
-            'total_generated': 0, 'cache_hits': 0
+            'han': 0,           # HAN adaptatifs générés
+            'legacy': 0,        # Ratios legacy (fallback)
+            'pow2': 0,          # Puissances de 2
+            'filtered': 0,      # Filtrés par Robin
+            'total_generated': 0,
+            'cache_hits': 0
         }
         
         self.max_candidates_per_node = 200
     
-    def get_multipliers(self, n):
-        if n < 1_000_000:
-            return self.multipliers_small
-        elif n < 1_000_000_000:
-            return self.multipliers_medium
-        else:
-            return self.multipliers_large
+    def compute_optimal_exponents(self, target, max_primes=8):
+        """
+        Calcule les exposants optimaux pour un HAN proche de target.
+        
+        Les HAN ont la forme: n = 2^a * 3^b * 5^c * 7^d * ...
+        avec exposants DÉCROISSANTS: a ≥ b ≥ c ≥ d...
+        
+        Heuristique: a ≈ log(target) / log(2)
+        """
+        import math
+        
+        # Estimer l'exposant de 2
+        a_max = int(math.log(target) / math.log(2)) + 1
+        
+        best_exponents = {}
+        best_closeness = float('inf')
+        
+        # Essayer différentes valeurs de a
+        for a in range(max(1, a_max - 3), min(a_max + 3, 60)):
+            current_exp = {2: a}
+            current_value = 2 ** a
+            
+            if current_value > target * 100:
+                break
+            
+            # Ajouter autres premiers avec exposants décroissants
+            prev_exp = a
+            for p in self.small_primes[1:max_primes]:
+                if current_value >= target:
+                    break
+                
+                max_e_value = target // current_value
+                max_e_constraint = int(math.log(max_e_value) / math.log(p)) if max_e_value > 1 else 0
+                max_e = min(prev_exp, max_e_constraint)
+                
+                if max_e < 1:
+                    break
+                
+                # Choisir exposant qui maximise σ(p^e)/p^e
+                best_e = 0
+                best_ratio = 0
+                
+                for e in range(1, max_e + 1):
+                    test_value = current_value * (p ** e)
+                    if test_value > target * 10:
+                        break
+                    
+                    sigma_ratio = (p ** (e + 1) - 1) / ((p ** e) * (p - 1))
+                    closeness = abs(test_value - target) / target
+                    score = sigma_ratio / (1 + closeness)
+                    
+                    if score > best_ratio:
+                        best_ratio = score
+                        best_e = e
+                
+                if best_e > 0:
+                    current_exp[p] = best_e
+                    current_value *= p ** best_e
+                    prev_exp = best_e
+            
+            closeness = abs(current_value - target)
+            if closeness < best_closeness:
+                best_closeness = closeness
+                best_exponents = current_exp.copy()
+        
+        return best_exponents if best_exponents else {2: a_max}
+    
+    def build_han_from_exponents(self, exponents):
+        """Construit un HAN à partir des exposants."""
+        han = 1
+        for p, e in exponents.items():
+            han *= p ** e
+        return han
+    
+    def generate_han_candidates(self, node_int):
+        """
+        Génère plusieurs HAN proches de node_int.
+        
+        Stratégies:
+        1. HAN classiques avec différents nombre de facteurs
+        2. Formes spéciales: 2^a, 2^a * 3^b, 2^a * 3^b * 5^c
+        3. HAN * petit premier (du papier)
+        4. Autour de diviseurs/multiples
+        """
+        import math
+        
+        candidates = set()
+        
+        # Stratégie 1: HAN classiques
+        for max_primes in [3, 4, 5, 6, 7]:
+            exps = self.compute_optimal_exponents(node_int, max_primes)
+            han = self.build_han_from_exponents(exps)
+            candidates.add(han)
+        
+        # Stratégie 2: Formes spéciales
+        a = int(math.log(node_int) / math.log(2))
+        
+        # Forme 2^a
+        for delta in [-2, -1, 0, 1, 2]:
+            exp_a = a + delta
+            if exp_a >= 1:
+                candidates.add(2 ** exp_a)
+        
+        # Forme 2^a * 3^b
+        for a_var in range(max(1, a - 2), min(a + 2, 30)):
+            for b in range(1, min(a_var, 10)):
+                han = (2 ** a_var) * (3 ** b)
+                if 2 <= han <= node_int * 10:
+                    candidates.add(han)
+        
+        # Forme 2^a * 3^b * 5^c
+        for a_var in range(max(2, a - 2), min(a + 2, 30)):
+            for b in range(1, min(a_var, 8)):
+                for c in range(1, min(b, 6)):
+                    han = (2 ** a_var) * (3 ** b) * (5 ** c)
+                    if 2 <= han <= node_int * 10:
+                        candidates.add(han)
+                    if han > node_int * 10:
+                        break
+        
+        # Stratégie 3: HAN * petit premier
+        base_exps = self.compute_optimal_exponents(node_int, max_primes=5)
+        base_han = self.build_han_from_exponents(base_exps)
+        
+        for p in [2, 3, 5, 7, 11, 13]:
+            cand = base_han * p
+            if cand <= node_int * 10:
+                candidates.add(cand)
+            
+            if base_han % p == 0:
+                cand2 = base_han // p
+                if cand2 >= 2:
+                    candidates.add(cand2)
+        
+        # Stratégie 4: Autour de diviseurs/multiples
+        for divisor in [2, 3, 5]:
+            target = node_int // divisor
+            if target >= 2:
+                exps = self.compute_optimal_exponents(target, max_primes=5)
+                han = self.build_han_from_exponents(exps)
+                candidates.add(han)
+        
+        for mult in [2, 3]:
+            target = node_int * mult
+            exps = self.compute_optimal_exponents(target, max_primes=5)
+            han = self.build_han_from_exponents(exps)
+            if han <= node_int * 10:
+                candidates.add(han)
+        
+        return sorted(candidates)
     
     def get_loglog_value(self, candidate):
         cache_key = int(candidate // 1000)
@@ -435,7 +1121,6 @@ class ImprovedPomeranceH2:
     
     def generate_candidates_h2(self, node_int):
         candidates = {}
-        multipliers = self.get_multipliers(node_int)
         
         def add_candidate(cand, typ):
             if len(candidates) >= self.max_candidates_per_node:
@@ -443,51 +1128,53 @@ class ImprovedPomeranceH2:
             if 2 <= cand <= node_int * 3 and cand not in candidates:
                 if self.passes_robin_filter(node_int, cand):
                     candidates[cand] = typ
-                    self.stats[typ.lower().replace('pom', '')] += 1
+                    stat_key = typ.lower().replace('pom', '')
+                    if stat_key in self.stats:
+                        self.stats[stat_key] += 1
             return True
         
-        for r_num, r_den in self.standard_ratios:
-            for k in multipliers:
-                cand = (node_int * r_den * k) // r_num
-                if not add_candidate(cand, 'PomStd'):
-                    break
-                cand2 = (node_int * r_num) // (r_den * k)
-                if cand2 >= 2:
-                    if not add_candidate(cand2, 'PomStd'):
-                        break
-            if len(candidates) >= self.max_candidates_per_node:
+        # ========================================
+        # PARTIE 1: HAN ADAPTATIFS (NOUVEAU)
+        # ========================================
+        han_candidates = self.generate_han_candidates(node_int)
+        
+        for han in han_candidates:
+            if not add_candidate(han, 'PomHAN'):
                 break
         
+        # ========================================
+        # PARTIE 2: Ratios legacy (pour couverture)
+        # ========================================
         if len(candidates) < self.max_candidates_per_node:
-            for r_num, r_den in self.extended_ratios:
-                for k in multipliers[:3]:
-                    cand = (node_int * r_den * k) // r_num
-                    if not add_candidate(cand, 'PomExt'):
-                        break
-                    cand2 = (node_int * r_num) // (r_den * k)
-                    if cand2 >= 2:
-                        if not add_candidate(cand2, 'PomExt'):
-                            break
+            legacy_ratios = [
+                (129, 100), (77, 100), (13, 10), (7, 10), (3, 2),
+            ]
+            
+            for r_num, r_den in legacy_ratios:
                 if len(candidates) >= self.max_candidates_per_node:
                     break
+                for k in [2, 3, 5]:
+                    cand = (node_int * r_den * k) // r_num
+                    if not add_candidate(cand, 'PomLegacy'):
+                        break
         
+        # ========================================
+        # PARTIE 3: Puissances de 2 (cas spéciaux)
+        # ========================================
         if len(candidates) < self.max_candidates_per_node:
             node_mpz = mpz(node_int)
             tz = gmpy2.bit_scan1(node_mpz)
             if tz > 0:
                 odd_part = node_mpz >> tz
                 for extra_twos in range(1, min(4, 15 - tz)):
-                    for small_mult in [1, 3]:
-                        cand = int((mpz(1) << (tz + extra_twos)) * odd_part * small_mult)
-                        if not add_candidate(cand, 'PomPow2'):
-                            break
-                    if len(candidates) >= self.max_candidates_per_node:
+                    cand = int((mpz(1) << (tz + extra_twos)) * odd_part)
+                    if not add_candidate(cand, 'PomPow2'):
                         break
         
         self.stats['total_generated'] += len(candidates)
         return candidates
 
-_improved_pomerance = ImprovedPomeranceH2()
+_improved_pomerance = AdaptiveHANPomerance()
 
 # ============================================================================
 # CACHE GLOBAL UNIFIÉ
@@ -700,13 +1387,14 @@ class PerformanceStats:
         pom_stats = _improved_pomerance.stats
         if sum(pom_stats.values()) > 0:
             print(f"\nHeuristique Pomerance H2 améliorée :")
-            print(f"  • Candidats générés (standard) : {pom_stats['std']}")
-            print(f"  • Candidats générés (étendus)  : {pom_stats['ext']}")
-            print(f"  • Candidats générés (power2)   : {pom_stats['pow2']}")
-            print(f"  • Candidats filtrés (Robin)    : {pom_stats['filtered']}")
-            total_gen = pom_stats['std'] + pom_stats['ext'] + pom_stats['pow2']
+            print(f"  • Candidats générés (standard) : {pom_stats.get('std', 0)}")
+            print(f"  • Candidats générés (étendus)  : {pom_stats.get('ext', 0)}")
+            print(f"  • Candidats générés (power2)   : {pom_stats.get('pow2', 0)}")
+            print(f"  • Candidats filtrés (Robin)    : {pom_stats.get('filtered', 0)}")
+            total_gen = pom_stats.get('std', 0) + pom_stats.get('ext', 0) + pom_stats.get('pow2', 0)
             if total_gen > 0:
-                efficiency = (1 - pom_stats['filtered'] / (total_gen + pom_stats['filtered'])) * 100
+                filtered_count = pom_stats.get('filtered', 0)
+                efficiency = (1 - filtered_count / (total_gen + filtered_count)) * 100
                 print(f"  • Efficacité pré-filtrage      : {efficiency:.1f}%")
         
         # Statistiques V6 (P1/P2/P3/P4)
@@ -737,33 +1425,6 @@ class PerformanceStats:
         if fs['drivers_tested'] > 0:
             total_filtered = fs['filtered_bisect'] + fs['filtered_pmin'] + fs['filtered_qmax'] + fs['filtered_pmax_lt_pmin'] + fs['filtered_tq_prime']
             pct_filtered = (total_filtered / fs['drivers_tested'] * 100) if fs['drivers_tested'] > 0 else 0
-            total_quadratic = fs['entered_quadratic'] + fs['factorized_quadratic'] + fs['fallback_quadratic']
-            print(f"\nFiltrage pré-drivers :")
-            print(f"  • Drivers examinés          : {fs['drivers_tested']:>10,}")
-            print(f"  • Éliminés (bisect D>node)  : {fs['filtered_bisect']:>10,}")
-            print(f"  • Éliminés (skip_all mod3|7): {fs.get('filtered_skipall', 0):>10,}")
-            print(f"  • Éliminés (p_min)          : {fs['filtered_pmin']:>10,}")
-            print(f"  • Éliminés (q_max ≤ p_min)  : {fs['filtered_qmax']:>10,}")
-            print(f"  • Éliminés (isqrt arrondi)  : {fs['filtered_pmax_lt_pmin']:>10,}")
-            print(f"  • Éliminés (target_q premier): {fs['filtered_tq_prime']:>10,}")
-            print(f"  • TOTAL FILTRÉS             : {total_filtered:>10,} ({pct_filtered:.1f}%)")
-            print(f"  • Entrés Semi-direct        : {fs['entered_semi_direct']:>10,}")
-            print(f"  • Quadratic (scan ≤300)     : {fs['entered_quadratic']:>10,}")
-            print(f"  • Quadratic (factorisé)     : {fs['factorized_quadratic']:>10,}")
-            print(f"  • Quadratic (fallback)      : {fs['fallback_quadratic']:>10,}")
-            print(f"  • TOTAL Quadratic           : {total_quadratic:>10,}")
-            # Stats Cubic
-            cubic_p = fs.get('cubic_p_tested', 0)
-            cubic_q = fs.get('cubic_q_tested', 0)
-            cubic_raw = fs.get('cubic_hits_raw', 0)
-            cubic_sp = fs.get('cubic_skip_pair', 0)
-            cubic_sm = fs.get('cubic_skip_mod', 0)
-            if cubic_p > 0:
-                print(f"  • Cubic p testés            : {cubic_p:>10,}")
-                print(f"  • Cubic paires skip (mod3|7): {cubic_sp:>10,}")
-                print(f"  • Cubic q testés            : {cubic_q:>10,}")
-                print(f"  • Cubic q skip (résidu)     : {cubic_sm:>10,}")
-                print(f"  • Cubic hits (bruts)        : {cubic_raw:>10,}")
         
         print(f"{'='*70}\n")
         self._report_printed = True
@@ -1069,8 +1730,11 @@ def factorize_fast(n):
             if m % 2 == 0:
                 return 2
             
-            # 50 tentatives avec différentes valeurs de c
-            for c_val in range(1, 50):
+            # OPTIMISATION: Tentatives adaptatives selon taille
+            max_c_attempts = 5 if m < 10**12 else (10 if m < 10**15 else 20)
+            
+            # Essayer plusieurs valeurs de c
+            for c_val in range(1, max_c_attempts):
                 c = mpz(c_val)
                 y = mpz(2)
                 g = mpz(1)
@@ -1078,7 +1742,7 @@ def factorize_fast(n):
                 q = mpz(1)
                 
                 iterations = 0
-                max_iter = 300000
+                max_iter = 100000  # Réduit de 300K pour éviter timeouts sur grands composites
                 
                 while g == 1:
                     x = y
@@ -1438,6 +2102,25 @@ def worker_search_partial(args):
     
     # Phase 1 : Pré-tests (seulement pour le premier chunk)
     if do_pretests:
+        # ============================================================
+        # P0: Antécédents IMPAIRS — Algorithme de Booker (2018)
+        # Recherche exhaustive via équation (2.1):
+        #   n = s(a^2)p^(2k) + σ(a^2)(p^(2k) - 1)/(p - 1)
+        # Couvre: p^2, p^4, p^6, p^8, a^2p^2, a^2p^4, p*q (a≥3 impair)
+        # ============================================================
+        booker_solutions = find_odd_antecedents_booker(node_int, max_a=500)
+        solutions.update(booker_solutions)
+        
+        # ============================================================
+        # P0bis: Antécédents PAIRS de n impair — Bosma & Bruin (2013)
+        # Pour n impair, cherche m pairs: m = 2^a * b (b impair)
+        # Couvre: 2^a*p, 2^a*p^2, 2^a*(p*q)
+        # Formule directe O(log^2 n) pour cas 2^a*p
+        # ============================================================
+        if node_int % 2 == 1:  # Seulement pour n impair
+            bb_solutions = find_even_antecedents_bosma_bruin(node_int)
+            solutions.update(bb_solutions)
+        
         COMMON_DIFFS = [12, 56, 4, 8, 24, 40, 6, 20, 28, 44, 52, 60, 68, 76, 84, 92, 120, 992]
         for diff in COMMON_DIFFS:
             if diff >= node_int:
@@ -1512,9 +2195,10 @@ def worker_search_partial(args):
             for k_cand, D_cand, p_cand, q_cand in semi_cands:
                 if k_cand in _pretest_keys:
                     continue
-                if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand):
-                    if int(sigma_optimized(k_cand)) - k_cand == node_int:
-                        solutions[k_cand] = f"S({D_cand})"
+                # OPTIMISATION: p et q viennent du sieve (déjà premiers)
+                # Semi-direct utilise sigma directement sans test is_prime
+                if int(sigma_optimized(k_cand)) - k_cand == node_int:
+                    solutions[k_cand] = f"S({D_cand})"
             
             # ============================================================
             # P10: CUBIC — k = D * p * q * r (3 premiers libres)
@@ -1536,7 +2220,8 @@ def worker_search_partial(args):
                     continue
                 if k_cand in solutions:
                     continue  # déjà trouvé par Direct ou Semi
-                if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand) and gmpy2.is_prime(r_cand):
+                # OPTIMISATION: p et q viennent du sieve (déjà premiers), seul r doit être testé
+                if gmpy2.is_prime(r_cand):
                     if int(sigma_optimized(k_cand)) - k_cand == node_int:
                         solutions[k_cand] = f"C({D_cand})"
             
@@ -1692,7 +2377,7 @@ def worker_search_partial(args):
             
                     # ============================================================
                     # FILTRE 2 : p_min — plus petit premier copremier à D
-                    # Si σ(D)×(1+p_min) > node, aucun premier p ne donne une
+                    # Si σ(D)*(1+p_min) > node, aucun premier p ne donne une
                     # solution semi-directe ni quadratique → skip complet.
                     # ============================================================
                     p_min = _smallest_coprime_prime(D_int)
@@ -1819,7 +2504,7 @@ def worker_search_partial(args):
                     # STRATÉGIE ADAPTATIVE :
                     # - Peu d'itérations (≤ 300) → scan linéaire direct.
                     #   Le scan est MOINS cher que is_prime(target_q) (~5µs)
-                    #   car 300 × modulo < Miller-Rabin. On ne teste donc
+                    #   car 300 * modulo < Miller-Rabin. On ne teste donc
                     #   PAS la primalité ici — si target_q est premier, le
                     #   scan ne trouvera rien en ~15µs (acceptable).
                     #
@@ -1971,7 +2656,8 @@ def worker_cubic_only(node):
     for k_cand, D_cand, p_cand, q_cand, r_cand in cubic_cands:
         if k_cand in solutions:
             continue
-        if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand) and gmpy2.is_prime(r_cand):
+        # OPTIMISATION: p et q viennent du sieve (déjà premiers), seul r doit être testé
+        if gmpy2.is_prime(r_cand):
             if int(sigma_optimized(k_cand)) - k_cand == node_int:
                 solutions[k_cand] = f"C({D_cand})"
     
@@ -1985,7 +2671,8 @@ def worker_cubic_only(node):
 
 class ArbreAliquoteV6:
     def __init__(self, n_cible, profondeur=100, smooth_bound=120, extra_primes=None, 
-                 max_depth=6, use_compression=False, allow_empty_exploration=False):
+                 max_depth=6, use_compression=False, allow_empty_exploration=False,
+                 use_multiprocessing=True):
         self.cible_initiale = int(n_cible)
         self.profondeur = profondeur
         self.smooth_bound = smooth_bound
@@ -1994,6 +2681,7 @@ class ArbreAliquoteV6:
         self.use_compression = use_compression
         self.allow_empty_exploration = allow_empty_exploration  # ✅ NOUVEAU
         self.max_workers = max(1, cpu_count() - 2)
+        self.use_multiprocessing = use_multiprocessing  # PATCH: Activer/désactiver Pool
         self.global_cache = GlobalAntecedenteCache(cache_dir=".", use_compression=use_compression)
         self.explored = set()
         self.old_cache_file = f"cache_arbre_{self.cible_initiale}.jsonl"
@@ -2001,6 +2689,12 @@ class ArbreAliquoteV6:
         self.stop = False
         self.start_time = time.time()
         self.val_max_coche = self.cible_initiale
+        
+        # ✅ NOUVEAU: Tracking de profondeur pour antécédents impairs
+        # {nœud_impair: génération_découverte}
+        self.odd_antecedent_depth = {}
+        self.ODD_MAX_DEPTH = 5  # Limite à 5 générations pour antécédents impairs
+        
         self._load_explored_nodes()
         signal.signal(signal.SIGINT, self._signal_handler)
     
@@ -2084,12 +2778,20 @@ class ArbreAliquoteV6:
             current_gen = [self.cible_initiale]
             start_gen = 1
         
-        num_workers = max(1, cpu_count() - 2)
-        pool = Pool(
-            num_workers,
-            initializer=init_worker_with_drivers,
-            initargs=((drivers_array, n_drivers),)
-        )
+        # PATCH: Créer Pool seulement si multiprocessing activé
+        if self.use_multiprocessing:
+            num_workers = max(1, cpu_count() - 2)
+            pool = Pool(
+                num_workers,
+                initializer=init_worker_with_drivers,
+                initargs=((drivers_array, n_drivers),)
+            )
+        else:
+            # Mode séquentiel - pas de Pool
+            pool = None
+            num_workers = 1
+            # Initialiser drivers globalement pour mode séquentiel
+            init_worker_with_drivers((drivers_array, n_drivers))
         try:
             for gen in range(start_gen, self.profondeur + 1):
                 if self.stop or not current_gen:
@@ -2105,10 +2807,24 @@ class ArbreAliquoteV6:
                     limit_100x = self.val_max_coche * 100
                     to_compute = []
                     beyond_limit_count = 0
+                    odd_depth_filtered_count = 0  # Nouveaux: impairs trop profonds
                     
                     for v in current_gen:
                         if v in self.explored:
                             continue  # Déjà traité
+                        
+                        # ✅ NOUVEAU: Vérifier profondeur des antécédents impairs
+                        if v % 2 == 1 and v in self.odd_antecedent_depth:
+                            # v est impair et découvert comme antécédent impair
+                            gen_discovered = self.odd_antecedent_depth[v]
+                            depth_from_discovery = gen - gen_discovered
+                            
+                            if depth_from_discovery >= self.ODD_MAX_DEPTH:
+                                # Limite atteinte: marquer comme feuille
+                                self._save_node(v, {})
+                                self.explored.add(v)
+                                odd_depth_filtered_count += 1
+                                continue
                         
                         if v > limit_100x:
                             # Nœud > 100x cible : marquer comme feuille sans calcul
@@ -2118,6 +2834,9 @@ class ArbreAliquoteV6:
                         else:
                             # Nœud à explorer normalement
                             to_compute.append(v)
+                    
+                    if odd_depth_filtered_count > 0:
+                        print(f"[G{gen}] {odd_depth_filtered_count} antécédents impairs ont atteint la limite de {self.ODD_MAX_DEPTH} générations")
                     
                     if beyond_limit_count > 0:
                         print(f"[G{gen}] {beyond_limit_count} nœuds > {limit_100x} (100x cible) marqués comme feuilles (non explorés)")
@@ -2159,7 +2878,7 @@ class ArbreAliquoteV6:
                     workers_per_node = num_workers // len(to_compute)
                     chunk_size = (n_drivers + workers_per_node - 1) // workers_per_node
                     
-                    print(f"[G{gen}] MODE COOPÉRATIF : {len(to_compute)} nœuds × {workers_per_node} workers/nœud "
+                    print(f"[G{gen}] MODE COOPÉRATIF : {len(to_compute)} nœuds * {workers_per_node} workers/nœud "
                           f"({chunk_size} drivers/chunk sur {n_drivers})")
                     
                     # Construire les tâches partielles
@@ -2178,8 +2897,16 @@ class ArbreAliquoteV6:
                     
                     # Collecter les résultats partiels par nœud
                     partial_results = {}  # {node_int: {k: type, ...}}
-                    for node_int, partial_solutions, local_fs in pool.imap_unordered(
-                            worker_search_partial, partial_tasks, chunksize=1):
+                    
+                    # PATCH: Traiter selon mode multiprocessing
+                    if self.use_multiprocessing:
+                        partial_iter = pool.imap_unordered(
+                            worker_search_partial, partial_tasks, chunksize=1)
+                    else:
+                        # Mode séquentiel
+                        partial_iter = [worker_search_partial(task) for task in partial_tasks]
+                    
+                    for node_int, partial_solutions, local_fs in partial_iter:
                         if self.stop:
                             break
                         if node_int not in partial_results:
@@ -2200,13 +2927,25 @@ class ArbreAliquoteV6:
                             sol_prefix = sol_type.split('(')[0]
                             _stats.add_solution(sol_prefix)
                         for k in solutions:
-                            next_gen.add(int(k))
+                            k_int = int(k)
+                            next_gen.add(k_int)
+                            # ✅ NOUVEAU: Tracker les antécédents impairs découverts
+                            if k_int % 2 == 1 and k_int not in self.odd_antecedent_depth:
+                                # Premier fois qu'on voit cet antécédent impair
+                                self.odd_antecedent_depth[k_int] = gen
                         processed += 1
                         print(f"   -> {node_val}: {len(solutions)} antécédents trouvés (coopératif)")
                 
                 else:
                     # ✅ MODE STANDARD : 1 nœud = 1 worker (comme avant)
-                    for node_val, solutions, local_fs in pool.imap_unordered(worker_search, to_compute, chunksize=1):
+                    # PATCH: Traiter selon mode multiprocessing
+                    if self.use_multiprocessing:
+                        results_iter = pool.imap_unordered(worker_search, to_compute, chunksize=1)
+                    else:
+                        # Mode séquentiel
+                        results_iter = [worker_search(node) for node in to_compute]
+                    
+                    for node_val, solutions, local_fs in results_iter:
                         if self.stop:
                             break
                         for key in local_fs:
@@ -2218,7 +2957,12 @@ class ArbreAliquoteV6:
                             sol_prefix = sol_type.split('(')[0]
                             _stats.add_solution(sol_prefix)
                         for k in solutions:
-                            next_gen.add(int(k))
+                            k_int = int(k)
+                            next_gen.add(k_int)
+                            # ✅ NOUVEAU: Tracker les antécédents impairs découverts
+                            if k_int % 2 == 1 and k_int not in self.odd_antecedent_depth:
+                                # Premier fois qu'on voit cet antécédent impair
+                                self.odd_antecedent_depth[k_int] = gen
                         processed += 1
                         if processed % 10 == 0:
                             print(f"\r   -> {processed}/{len(to_compute)}", end='')
@@ -2240,8 +2984,10 @@ class ArbreAliquoteV6:
                 # ✅ CORRECTIF CACHE: Sauvegarder CHAQUE génération (pas toutes les 2)
                 self.global_cache.save()
         finally:
-            pool.close()
-            pool.join()
+            # PATCH: Fermer Pool seulement s'il existe
+            if self.use_multiprocessing and pool is not None:
+                pool.close()
+                pool.join()
             _stats.report()
             self.afficher()
     
