@@ -648,18 +648,9 @@ def cubic_loop(
 
             st_pairs_survived += 1
 
-            # Bisect: premier indice dans sieve > p_v
-            qi_lo = 1
-            qi_hi = sieve_len
-            while qi_lo < qi_hi:
-                qi_mid = (qi_lo + qi_hi) // 2
-                if sv[qi_mid] <= p_v:
-                    qi_lo = qi_mid + 1
-                else:
-                    qi_hi = qi_mid
-
+            # Premier q > p_v : indice pi_p+1 dans le même crible
             # Boucle sur q > p
-            for pi_q in range(qi_lo, sieve_len):
+            for pi_q in range(pi_p + 1, sieve_len):
                 q_v = sv[pi_q]
                 if q_v > q_max_cubic:
                     break
@@ -705,11 +696,12 @@ def cubic_loop(
                     continue
 
                 # r premier? Test rapide: pair ou div par petit premier
+                # (r_v > q_v > p_v >= 3, donc r_v > 5 toujours vrai)
                 if r_v % 2 == 0:
                     continue
-                if r_v > 3 and r_v % 3 == 0:
+                if r_v % 3 == 0:
                     continue
-                if r_v > 5 and r_v % 5 == 0:
+                if r_v % 5 == 0:
                     continue
 
                 st_hits += 1

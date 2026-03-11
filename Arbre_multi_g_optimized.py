@@ -842,6 +842,8 @@ _filter_stats = {
     'entered_quadratic': 0,     # Entres dans Quadratic (scan lineaire <=300 iters)
     'factorized_quadratic': 0,  # Entres dans Quadratic (approche factorisee)
     'fallback_quadratic': 0,    # Fallback scan lineaire (factorisation echouee)
+    'filtered_pkill': 0,        # Elimines par p_kill (p ≡ pk mod m → m|den_q)
+    'filtered_mod8': 0,         # Elimines par filtre mod8 (8|den_q ET 8∤num_q)
     'cubic_p_tested': 0,        # Cubic: premiers p testes
     'cubic_q_tested': 0,        # Cubic: iterations q (boucle interieure)
     'cubic_hits_raw': 0,        # Cubic: hits bruts (avant isprime)
@@ -1431,10 +1433,13 @@ def worker_search_partial(args):
     drv = _worker_drivers
     
     # Compteurs locaux (renvoyés au processus principal)
-    lf = {'drivers_tested': 0, 'filtered_bisect': 0, 'filtered_pmin': 0,
-          'filtered_qmax': 0, 'filtered_pmax_lt_pmin': 0, 'filtered_tq_prime': 0,
+    lf = {'drivers_tested': 0, 'filtered_bisect': 0, 'filtered_skipall': 0,
+          'filtered_pmin': 0, 'filtered_qmax': 0, 'filtered_pmax_lt_pmin': 0,
+          'filtered_pkill': 0, 'filtered_mod8': 0, 'filtered_tq_prime': 0,
           'entered_semi_direct': 0, 'entered_quadratic': 0,
-          'factorized_quadratic': 0, 'fallback_quadratic': 0}
+          'factorized_quadratic': 0, 'fallback_quadratic': 0,
+          'cubic_p_tested': 0, 'cubic_q_tested': 0, 'cubic_hits_raw': 0,
+          'cubic_skip_pair': 0, 'cubic_skip_mod': 0}
     
     # Phase 1 : Pré-tests (seulement pour le premier chunk)
     if do_pretests:
@@ -1491,10 +1496,12 @@ def worker_search_partial(args):
             # Accumuler les stats Cython
             lf['drivers_tested'] += c_stats.get('drivers_tested', 0)
             lf['filtered_bisect'] += c_stats.get('filtered_bisect', 0)
-            lf['filtered_skipall'] = lf.get('filtered_skipall', 0) + c_stats.get('filtered_skipall', 0)
+            lf['filtered_skipall'] += c_stats.get('filtered_skipall', 0)
             lf['filtered_pmin'] += c_stats.get('filtered_pmin', 0)
             lf['filtered_qmax'] += c_stats.get('filtered_qmax', 0)
             lf['filtered_pmax_lt_pmin'] += c_stats.get('filtered_pmax_lt_pmin', 0)
+            lf['filtered_pkill'] += c_stats.get('filtered_pkill', 0)
+            lf['filtered_mod8'] += c_stats.get('filtered_mod8', 0)
             lf['entered_semi_direct'] += c_stats.get('entered_semi_direct', 0)
             
             # Vérifier les candidats Direct
@@ -1525,11 +1532,11 @@ def worker_search_partial(args):
                 node_int, _worker_drv_np, drv_start, drv_end,
                 _worker_sieve_np, len(_SEMI_DIRECT_PRIMES)
             )
-            lf['cubic_p_tested'] = lf.get('cubic_p_tested', 0) + cubic_stats.get('p_tested', 0)
-            lf['cubic_q_tested'] = lf.get('cubic_q_tested', 0) + cubic_stats.get('q_tested', 0)
-            lf['cubic_hits_raw'] = lf.get('cubic_hits_raw', 0) + cubic_stats.get('hits', 0)
-            lf['cubic_skip_pair'] = lf.get('cubic_skip_pair', 0) + cubic_stats.get('skip_pair', 0)
-            lf['cubic_skip_mod'] = lf.get('cubic_skip_mod', 0) + cubic_stats.get('skip_mod', 0)
+            lf['cubic_p_tested'] += cubic_stats.get('p_tested', 0)
+            lf['cubic_q_tested'] += cubic_stats.get('q_tested', 0)
+            lf['cubic_hits_raw'] += cubic_stats.get('hits', 0)
+            lf['cubic_skip_pair'] += cubic_stats.get('skip_pair', 0)
+            lf['cubic_skip_mod'] += cubic_stats.get('skip_mod', 0)
             
             for k_cand, D_cand, p_cand, q_cand, r_cand in cubic_cands:
                 if k_cand in _pretest_keys:
@@ -1971,10 +1978,11 @@ def worker_cubic_only(node):
     for k_cand, D_cand, p_cand, q_cand, r_cand in cubic_cands:
         if k_cand in solutions:
             continue
-        if gmpy2.is_prime(p_cand) and gmpy2.is_prime(q_cand) and gmpy2.is_prime(r_cand):
+        # p_cand and q_cand come from the sieve — already prime
+        if gmpy2.is_prime(r_cand):
             if int(sigma_optimized(k_cand)) - k_cand == node_int:
                 solutions[k_cand] = f"C({D_cand})"
-    
+
     return (node_int, solutions, lf)
 
 
@@ -2252,8 +2260,6 @@ class ArbreAliquoteV6:
         aux nœuds existants du cache, puis relance un construire normal
         pour explorer les nouvelles branches découvertes.
         """
-        import time as _time
-        
         drivers_array, n_drivers = get_cached_drivers(
             self.cible_initiale, self.val_max_coche,
             self.smooth_bound, self.extra_primes,
@@ -2291,27 +2297,21 @@ class ArbreAliquoteV6:
         
         new_solutions_total = 0
         nodes_updated = 0
-        t0 = _time.time()
-        
+        t0 = time.time()
+        chunksize = max(4, len(all_nodes) // (num_workers * 8))
+        report_interval = max(100, len(all_nodes) // 20)
+        processed = 0
+
         try:
-            # Traiter par batch pour afficher la progression
-            batch_size = max(100, len(all_nodes) // 20)
-            
-            for batch_start in range(0, len(all_nodes), batch_size):
-                batch = all_nodes[batch_start:batch_start + batch_size]
-                batch_new = 0
-                
-                for node_int, solutions, local_fs in pool.imap_unordered(
-                        worker_cubic_only, batch, chunksize=max(1, len(batch) // num_workers)):
-                    
-                    if not solutions:
-                        continue
-                    
+            for node_int, solutions, local_fs in pool.imap_unordered(
+                    worker_cubic_only, all_nodes, chunksize=chunksize):
+
+                if solutions:
                     # Charger les antécédents existants
                     existing = self.global_cache.get_antecedents(node_int)
                     if existing is None:
                         existing = {}
-                    
+
                     # Ajouter seulement les NOUVELLES solutions
                     added = 0
                     for k, stype in solutions.items():
@@ -2319,22 +2319,22 @@ class ArbreAliquoteV6:
                         if k_str not in existing:
                             existing[k_str] = stype
                             added += 1
-                    
+
                     if added > 0:
                         self.global_cache.cache[str(node_int)] = existing
                         nodes_updated += 1
-                        batch_new += added
                         new_solutions_total += added
-                
-                elapsed = _time.time() - t0
-                progress = min(batch_start + len(batch), len(all_nodes))
-                print(f"  [{progress}/{len(all_nodes)}] +{batch_new} nouvelles solutions ({elapsed:.1f}s)")
+
+                processed += 1
+                if processed % report_interval == 0 or processed == len(all_nodes):
+                    elapsed = time.time() - t0
+                    print(f"  [{processed}/{len(all_nodes)}] +{new_solutions_total} nouvelles solutions ({elapsed:.1f}s)")
         
         finally:
             pool.close()
             pool.join()
         
-        elapsed = _time.time() - t0
+        elapsed = time.time() - t0
         print(f"\n[Cubic Rescan] Terminé en {elapsed:.1f}s")
         print(f"  • Nœuds rescannés : {len(all_nodes)}")
         print(f"  • Nœuds avec nouvelles solutions : {nodes_updated}")
