@@ -1271,27 +1271,37 @@ class GlobalAntecedenteCache:
             self.incremental_file = None  # Pas utilisé en mode SQLite
             self.stats = {'total_entries': 0, 'cache_hits': 0, 'cache_misses': 0, 'new_entries': 0}
             print(f"[Cache] Backend: SQLite")
-            return
-        
-        # Fallback JSON
-        self.backend = 'json'
-        self.db = None
-        self.use_compression = use_compression
-        if use_compression:
-            self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json.gz")
+            self._load_cache()  # Charger stats depuis DB
+            # Pas de return ici - continuer pour appeler _load_cache()
         else:
-            self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json")
-        self.incremental_file = os.path.join(cache_dir, "antecedents_incremental.jsonl")
-        self.cache = {}
-        self.stats = {
-            'total_entries': 0,
-            'cache_hits': 0,
-            'cache_misses': 0,
-            'new_entries': 0,
-        }
-        self._load_cache()
+            # Fallback JSON
+            self.backend = 'json'
+            self.db = None
+            self.use_compression = use_compression
+            if use_compression:
+                self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json.gz")
+            else:
+                self.cache_file = os.path.join(cache_dir, "antecedents_global_cache.json")
+            self.incremental_file = os.path.join(cache_dir, "antecedents_incremental.jsonl")
+            self.cache = {}
+            self.stats = {
+                'total_entries': 0,
+                'cache_hits': 0,
+                'cache_misses': 0,
+                'new_entries': 0,
+            }
+            self._load_cache()
     
     def _load_cache(self):
+        # Mode SQLite : pas de chargement, la DB est déjà connectée
+        if hasattr(self, 'backend') and self.backend == 'sqlite':
+            # Compter les entrées existantes
+            count = self.db.count()
+            self.stats['total_entries'] = count
+            print(f"[Cache Global] SQLite: {count:,} nœuds en DB")
+            return
+        
+        # Mode JSON : comportement original
         print(f"[Cache Global] Chargement depuis {self.cache_file}...")
         if os.path.exists(self.cache_file):
             try:
@@ -1347,12 +1357,17 @@ class GlobalAntecedenteCache:
             return None
     
     def add_antecedents(self, aliquot, antecedents_dict):
+        # Mode SQLite : écrire directement en DB
+        if hasattr(self, 'backend') and self.backend == 'sqlite':
+            self.db.set(aliquot, antecedents_dict or {})
+            self.stats['new_entries'] += 1
+            return
+        
+        # Mode JSON
         aliquot_str = str(aliquot)
         if aliquot_str not in self.cache:
             self.cache[aliquot_str] = {}
             self.stats['new_entries'] += 1
-        # ✅ CORRECTIF CACHE: Toujours mettre à jour, même si dict vide
-        # Cela marque le nœud comme "complètement exploré"
         self.cache[aliquot_str].update(antecedents_dict or {})
         self._save_incremental(aliquot_str, antecedents_dict or {})
     
@@ -3237,7 +3252,7 @@ class ArbreAliquoteV6:
                             added += 1
                     
                     if added > 0:
-                        self.global_cache.cache[str(node_int)] = existing
+                        self.global_cache.add_antecedents(node_int, existing)
                         nodes_updated += 1
                         batch_new += added
                         new_solutions_total += added
@@ -3271,7 +3286,15 @@ class ArbreAliquoteV6:
             print("  • Aucune nouvelle solution — pas de relance nécessaire.")
 
     def _resume_from_cache(self):
-        raw_cache = self.global_cache.cache or {}
+        # Mode SQLite : lire depuis DB
+        if hasattr(self.global_cache, 'backend') and self.global_cache.backend == 'sqlite':
+            raw_cache = {}
+            cursor = self.global_cache.db.conn.execute('SELECT node, antecedents_json FROM antecedents')
+            for row in cursor:
+                raw_cache[str(row[0])] = json.loads(row[1])
+        else:
+            # Mode JSON
+            raw_cache = self.global_cache.cache or {}
         
         # ✅ CORRECTIF: Charger d'abord TOUT le cache
         full_cache = {}
