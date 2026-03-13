@@ -268,11 +268,10 @@ def driver_loop_direct_semi(
         den_qmin = SD + p_min * sD
         if num_qmin <= p_min * den_qmin:
             continue
-
-        # ---- sqrt(target_q) via float64 + p_max ----
-        sq_f = sqrt(target_q_f)
-        p_max = <long long>((sq_f - <double>SD) / <double>sD) + 1
-
+		# ---- sqrt(target_q) via float64 + p_max ----
+        target_q = <long long>target_q_f  # Correction : Définition de target_q
+        sq_i = isqrt_c(target_q)
+        p_max = (sq_i - SD) // sD + 1
         if p_max < p_min:
             continue
 
@@ -596,8 +595,8 @@ def cubic_loop(
 
             # OPTIMISATION: Utiliser sqrt précalculé au lieu de sqrt(node/SDp)
             # q_max = sqrt(node/SDp) - 1 = sqrt(node/SD) / sqrt(1 + p) - 1
-            q_max_f = sqrt_node_over_SD / sqrt(1.0 + <double>p_v) - 1.0
-            q_max_cubic = <long long>q_max_f
+            # Borne isqrt sur q (arithmétique exacte)
+            q_max_cubic = isqrt_c(node // SDp)
             if q_max_cubic <= p_v:
                 continue
             
